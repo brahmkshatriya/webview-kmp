@@ -5,17 +5,21 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 
+val androidCompileSdk = providers.gradleProperty("androidCompileSdk").get().toInt()
+val androidMinSdk = providers.gradleProperty("androidMinSdk").get().toInt()
+val androidxComposeUiVersion = providers.gradleProperty("androidxComposeUiVersion").get()
+
 kotlin {
     explicitApi()
     android {
         namespace = "dev.brahmkshatriya.webview.android"
-        compileSdk = 37
-        minSdk = 24
+        compileSdk = androidCompileSdk
+        minSdk = androidMinSdk
     }
     sourceSets {
         androidMain.dependencies {
             api(project(":webview-core"))
-            api("androidx.compose.ui:ui:1.10.5")
+            api("androidx.compose.ui:ui:$androidxComposeUiVersion")
         }
     }
 }

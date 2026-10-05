@@ -6,14 +6,17 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 
-val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()
+val composeNativeVersion = providers.gradleProperty("composeNativeVersion").get()
+val composeUiVersion = providers.gradleProperty("composeUiVersion").get()
+val androidCompileSdk = providers.gradleProperty("androidCompileSdk").get().toInt()
+val androidMinSdk = providers.gradleProperty("androidMinSdk").get().toInt()
 
 kotlin {
     explicitApi()
     android {
         namespace = "dev.brahmkshatriya.webview.compose"
-        compileSdk = 37
-        minSdk = 24
+        compileSdk = androidCompileSdk
+        minSdk = androidMinSdk
     }
     js { browser() }
     iosArm64()
@@ -28,7 +31,7 @@ kotlin {
         val commonMain = getByName("commonMain")
         commonMain.dependencies {
             api(project(":webview-core"))
-            api("org.jetbrains.compose.ui:ui:1.13.0-alpha01")
+            api("org.jetbrains.compose.ui:ui:$composeUiVersion")
         }
         getByName("desktopNativeMain") {
             dependencies {

@@ -14,8 +14,8 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 
-val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()
-val webView2SdkVersion = providers.gradleProperty("webView2SdkVersion").orElse("1.0.4129.50").get()
+val composeNativeVersion = providers.gradleProperty("composeNativeVersion").get()
+val webView2SdkVersion = providers.gradleProperty("webView2SdkVersion").get()
 val webView2SdkPackage = providers.gradleProperty("webView2SdkPackage")
 val webView2SdkDir = layout.buildDirectory.dir("webview2-sdk/$webView2SdkVersion")
 val webView2IncludeDir = webView2SdkDir.map { it.dir("include") }

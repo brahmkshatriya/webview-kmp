@@ -31,6 +31,6 @@ Platform build jobs receive neither secret.
 ## Version
 
 For a tag build, the tag name is used as the Maven version. A leading `v` is stripped, so both
-`0.1.0-alpha01` and `v0.1.0-alpha01` publish `0.1.0-alpha01`.
+`<version>` and `v<version>` publish `<version>`.
 
 For a manual release, run the `Publish` workflow and provide the version input.

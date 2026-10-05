@@ -1,5 +1,7 @@
 # webview-kmp
 
+[![Maven Central](https://img.shields.io/maven-central/v/dev.brahmkshatriya.webview/webview-compose.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/dev.brahmkshatriya.webview/webview-compose)
+
 A Kotlin Multiplatform WebView for Compose.
 
 `webview-kmp` uses the browser engine that is already available on each platform. It does not bundle
@@ -130,7 +132,7 @@ val controller = rememberWebViewController(
 ```kotlin
 val controller = rememberWebViewController(
     config = WebViewConfig(
-        userAgent = UserAgent.Custom("MyApp/1.0"),
+        userAgent = UserAgent.Custom("MyApp"),
     ),
 )
 ```
@@ -243,8 +245,7 @@ Uses the WebView provider installed on the device. No browser engine is packaged
 
 Use Apple's system WKWebView. No WebKit binary is packaged by this library.
 
-macOS requires Compose Native `1.13.0-alpha10` or newer because that release added native AppKit
-view support.
+macOS requires a Compose Native release that includes native AppKit view interop.
 
 ### Linux
 

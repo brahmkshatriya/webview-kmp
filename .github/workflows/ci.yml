@@ -81,7 +81,10 @@ jobs:
       - name: Install Android SDK
         if: matrix.android == true
         shell: bash
-        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+        run: |
+          compile_sdk="$(sed -n 's/^androidCompileSdk=//p' gradle.properties)"
+          build_tools="$(sed -n 's/^androidBuildToolsVersion=//p' gradle.properties)"
+          sdkmanager "platforms;android-${compile_sdk}" "build-tools;${build_tools}"
 
       - name: Verify runner architecture
         if: matrix.expected_arch
@@ -124,7 +127,7 @@ jobs:
       - name: Build KMP root publications
         shell: bash
         env:
-          ORG_GRADLE_PROJECT_VERSION_NAME: 0.0.0-ci
+          ORG_GRADLE_PROJECT_VERSION_NAME: ci
           ORG_GRADLE_PROJECT_webviewMetadataOnly: 'true'
         run: |
           set -euo pipefail
@@ -142,4 +145,4 @@ jobs:
           python3 scripts/prepare-maven-central-bundle.py \
             --repository build/maven-release-shard \
             --staging build/central-metadata-check \
-            --version 0.0.0-ci
+            --version ci

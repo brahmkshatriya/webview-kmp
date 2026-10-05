@@ -5,7 +5,7 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 
-val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()
+val composeNativeVersion = providers.gradleProperty("composeNativeVersion").get()
 
 kotlin {
     explicitApi()

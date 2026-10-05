@@ -5,8 +5,9 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 
-val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()
-val waylandAppViewVersion = providers.gradleProperty("waylandAppViewVersion").orElse("0.1.0").get()
+val composeNativeVersion = providers.gradleProperty("composeNativeVersion").get()
+val waylandAppViewVersion = providers.gradleProperty("waylandAppViewVersion").get()
+val serializationJsonVersion = providers.gradleProperty("serializationJsonVersion").get()
 val metadataOnly = providers.gradleProperty("webviewMetadataOnly").map(String::toBoolean).orElse(false).get()
 val linuxInteropDir = layout.projectDirectory.dir("src/nativeInterop/linux")
 val linuxInteropIncludeDir = linuxInteropDir.dir("include")
@@ -218,7 +219,7 @@ kotlin {
             dependencies {
                 api(project(":webview-core"))
                 implementation("dev.brahmkshatriya.wayland:wayland-appview:$waylandAppViewVersion")
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationJsonVersion")
             }
         }
         linuxArm64Main {
@@ -226,7 +227,7 @@ kotlin {
             dependencies {
                 api(project(":webview-core"))
                 implementation("dev.brahmkshatriya.wayland:wayland-appview:$waylandAppViewVersion")
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationJsonVersion")
             }
         }
         linuxX64Test.dependencies {

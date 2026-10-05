@@ -1,13 +1,13 @@
 plugins {
-    kotlin("multiplatform") version "2.4.20" apply false
-    id("org.jetbrains.kotlin.plugin.compose") version "2.4.20" apply false
-    id("com.android.kotlin.multiplatform.library") version "9.4.0" apply false
-    id("dev.brahmkshatriya.compose") version "1.13.0-alpha10" apply false
-    id("com.vanniktech.maven.publish") version "0.37.0" apply false
+    kotlin("multiplatform") apply false
+    id("org.jetbrains.kotlin.plugin.compose") apply false
+    id("com.android.kotlin.multiplatform.library") apply false
+    id("dev.brahmkshatriya.compose") apply false
+    id("com.vanniktech.maven.publish") apply false
 }
 
 val libraryGroup = providers.gradleProperty("GROUP").orElse("dev.brahmkshatriya.webview")
-val libraryVersion = providers.gradleProperty("VERSION_NAME").orElse("0.1.0-SNAPSHOT")
+val libraryVersion = providers.gradleProperty("VERSION_NAME").orElse("unspecified")
 
 allprojects {
     group = libraryGroup.get()

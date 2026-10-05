@@ -4,6 +4,8 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 
+val composeUiVersion = providers.gradleProperty("composeUiVersion").get()
+
 kotlin {
     explicitApi()
     iosArm64()
@@ -15,7 +17,7 @@ kotlin {
             dependsOn(commonMain)
             dependencies {
                 api(project(":webview-core"))
-                api("org.jetbrains.compose.ui:ui:1.13.0-alpha01")
+                api("org.jetbrains.compose.ui:ui:$composeUiVersion")
             }
         }
         iosArm64Main.get().dependsOn(iosMain)
