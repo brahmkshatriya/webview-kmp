@@ -1,0 +1,4 @@
+headers = system_webview2.h
+headerFilter = system_webview2.h
+package = dev.brahmkshatriya.webview.internal.webview2
+linkerOpts = -lole32 -lwindowscodecs -luuid -luser32 -lstdc++
