@@ -7,7 +7,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-image="${WEBVIEW_KMP_LINUX_CI_IMAGE:-debian:trixie}"
+image="${WEBVIEW_KMP_LINUX_CI_IMAGE:-debian:forky}"
 tasks="$*"
 
 docker run --rm \
