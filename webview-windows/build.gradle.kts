@@ -1,6 +1,7 @@
 @file:OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
 
 import org.gradle.api.GradleException
+import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Exec
 import java.net.URI
@@ -10,7 +11,7 @@ plugins {
     kotlin("multiplatform")
     id("org.jetbrains.kotlin.plugin.compose")
     id("dev.brahmkshatriya.compose")
-    `maven-publish`
+    id("com.vanniktech.maven.publish")
 }
 
 val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()
@@ -132,6 +133,23 @@ kotlin {
         }
         mingwX64Main.dependencies {
             api(project(":webview-core"))
+        }
+    }
+}
+
+publishing {
+    publications.withType<MavenPublication>().configureEach {
+        if (name == "mingwX64") {
+            artifact(webView2LoaderDll) {
+                classifier = "webview2-loader"
+                extension = "dll"
+                builtBy(prepareWebView2Sdk)
+            }
+            artifact(webView2License) {
+                classifier = "webview2-license"
+                extension = "txt"
+                builtBy(prepareWebView2Sdk)
+            }
         }
     }
 }

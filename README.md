@@ -212,7 +212,12 @@ already have it.
 
 Your application also needs Microsoft's small `WebView2Loader.dll` next to the final `.exe`.
 
-This project provides a task that copies the loader and its license into one directory:
+The Windows Maven artifact publishes that DLL and Microsoft's license alongside the Kotlin/Native
+library. They use the classifiers `webview2-loader` and `webview2-license`, so packaging tools can
+resolve the loader directly from Maven instead of cloning this repository.
+
+If you are building this repository itself, the convenience task below copies both files into one
+directory:
 
 ```shell
 ./gradlew copyWindowsWebView2Loader

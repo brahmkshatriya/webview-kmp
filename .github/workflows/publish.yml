@@ -1,0 +1,283 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish
+        required: true
+        type: string
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="$MANUAL_VERSION"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ || "$version" == *SNAPSHOT* ]]; then
+            echo "Invalid Maven release version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  platform:
+    name: Publish ${{ matrix.name }} shard
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: android
+            name: Android
+            runner: ubuntu-24.04
+            android: true
+            tasks: ':webview-core:publishAndroidPublicationToReleaseShardRepository :webview-android:publishAndroidPublicationToReleaseShardRepository :webview-compose:publishAndroidPublicationToReleaseShardRepository'
+          - id: js
+            name: JavaScript
+            runner: ubuntu-24.04
+            tasks: ':webview-core:publishJsPublicationToReleaseShardRepository :webview-js:publishJsPublicationToReleaseShardRepository :webview-compose:publishJsPublicationToReleaseShardRepository'
+          - id: linux-x64
+            name: Linux x64
+            runner: ubuntu-24.04
+            linux: true
+            expected_arch: x86_64
+            tasks: ':webview-core:publishLinuxX64PublicationToReleaseShardRepository :webview-linux:publishLinuxX64PublicationToReleaseShardRepository :webview-compose:publishLinuxX64PublicationToReleaseShardRepository'
+          - id: linux-arm64
+            name: Linux arm64
+            runner: ubuntu-24.04-arm
+            linux: true
+            expected_arch: aarch64
+            tasks: ':webview-core:publishLinuxArm64PublicationToReleaseShardRepository :webview-linux:publishLinuxArm64PublicationToReleaseShardRepository :webview-compose:publishLinuxArm64PublicationToReleaseShardRepository'
+          - id: windows-x64
+            name: Windows x64
+            runner: windows-2025
+            tasks: ':webview-core:publishMingwX64PublicationToReleaseShardRepository :webview-windows:publishMingwX64PublicationToReleaseShardRepository :webview-compose:publishMingwX64PublicationToReleaseShardRepository'
+          - id: macos-x64
+            name: macOS x64
+            runner: macos-15-intel
+            expected_arch: x86_64
+            tasks: ':webview-core:publishMacosX64PublicationToReleaseShardRepository :webview-macos:publishMacosX64PublicationToReleaseShardRepository :webview-compose:publishMacosX64PublicationToReleaseShardRepository'
+          - id: macos-arm64
+            name: macOS arm64
+            runner: macos-15
+            expected_arch: arm64
+            tasks: ':webview-core:publishMacosArm64PublicationToReleaseShardRepository :webview-macos:publishMacosArm64PublicationToReleaseShardRepository :webview-compose:publishMacosArm64PublicationToReleaseShardRepository'
+          - id: ios-arm64
+            name: iOS arm64
+            runner: macos-15
+            expected_arch: arm64
+            tasks: ':webview-core:publishIosArm64PublicationToReleaseShardRepository :webview-ios:publishIosArm64PublicationToReleaseShardRepository :webview-compose:publishIosArm64PublicationToReleaseShardRepository'
+          - id: ios-simulator-arm64
+            name: iOS Simulator arm64
+            runner: macos-15
+            expected_arch: arm64
+            tasks: ':webview-core:publishIosSimulatorArm64PublicationToReleaseShardRepository :webview-ios:publishIosSimulatorArm64PublicationToReleaseShardRepository :webview-compose:publishIosSimulatorArm64PublicationToReleaseShardRepository'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        if: matrix.linux != true
+        with:
+          distribution: corretto
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v6
+        if: matrix.linux != true
+
+      - uses: android-actions/setup-android@v4
+        if: matrix.android == true
+      - name: Install Android SDK
+        if: matrix.android == true
+        shell: bash
+        run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+
+      - name: Verify runner architecture
+        if: matrix.expected_arch
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: test "$(uname -m)" = "$EXPECTED_ARCH"
+
+      - name: Verify Xcode
+        if: startsWith(matrix.id, 'macos-') || startsWith(matrix.id, 'ios-')
+        shell: bash
+        run: xcodebuild -version
+
+      - name: Build Linux Maven publications
+        if: matrix.linux == true
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_VERSION_NAME: ${{ needs.prepare.outputs.version }}
+          TARGET_TASKS: ${{ matrix.tasks }}
+        run: |
+          set -euo pipefail
+          rm -rf build/maven-release-shard
+          chmod +x scripts/run-linux-ci.sh
+          scripts/run-linux-ci.sh $TARGET_TASKS
+          test -d build/maven-release-shard/dev/brahmkshatriya/webview
+
+      - name: Build target Maven publications
+        if: matrix.linux != true
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_VERSION_NAME: ${{ needs.prepare.outputs.version }}
+          TARGET_TASKS: ${{ matrix.tasks }}
+        run: |
+          set -euo pipefail
+          rm -rf build/maven-release-shard
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache $TARGET_TASKS
+          test -d build/maven-release-shard/dev/brahmkshatriya/webview
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webview-kmp-repo-${{ matrix.id }}-${{ needs.prepare.outputs.version }}
+          path: build/maven-release-shard
+          if-no-files-found: error
+          retention-days: 5
+
+  metadata:
+    name: Publish KMP root metadata shard
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Publish KMP roots
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_VERSION_NAME: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf build/maven-release-shard
+          chmod +x scripts/run-linux-ci.sh
+          scripts/run-linux-ci.sh \
+            :webview-core:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-compose:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-android:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-ios:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-js:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-linux:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-macos:publishKotlinMultiplatformPublicationToReleaseShardRepository \
+            :webview-windows:publishKotlinMultiplatformPublicationToReleaseShardRepository
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webview-kmp-repo-metadata-${{ needs.prepare.outputs.version }}
+          path: build/maven-release-shard
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Sign and publish Maven Central deployment
+    needs: [prepare, platform, metadata]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: webview-kmp-repo-*-${{ needs.prepare.outputs.version }}
+          path: release/shards
+
+      - name: Merge Maven shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/merged
+          for repository in release/shards/webview-kmp-repo-*; do
+            cp -a "$repository/." release/merged/
+          done
+
+      - name: Verify merged target set
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="release/merged/dev/brahmkshatriya/webview"
+          modules=(
+            webview-core webview-compose webview-android webview-ios webview-js webview-linux webview-macos webview-windows
+            webview-core-android webview-core-js webview-core-linuxx64 webview-core-linuxarm64 webview-core-mingwx64 webview-core-macosx64 webview-core-macosarm64 webview-core-iosarm64 webview-core-iossimulatorarm64
+            webview-compose-android webview-compose-js webview-compose-linuxx64 webview-compose-linuxarm64 webview-compose-mingwx64 webview-compose-macosx64 webview-compose-macosarm64 webview-compose-iosarm64 webview-compose-iossimulatorarm64
+            webview-android-android webview-js-js webview-linux-linuxx64 webview-linux-linuxarm64 webview-windows-mingwx64 webview-macos-macosx64 webview-macos-macosarm64 webview-ios-iosarm64 webview-ios-iossimulatorarm64
+          )
+          for module in "${modules[@]}"; do
+            directory="$root/$module/$RELEASE_VERSION"
+            test -d "$directory" || { echo "Missing publication: $module" >&2; exit 1; }
+            test -n "$(find "$directory" -maxdepth 1 -name '*.pom' -print -quit)" || { echo "Missing POM: $module" >&2; exit 1; }
+          done
+          windows_directory="$root/webview-windows-mingwx64/$RELEASE_VERSION"
+          test -f "$windows_directory/webview-windows-mingwx64-$RELEASE_VERSION-webview2-loader.dll"
+          test -f "$windows_directory/webview-windows-mingwx64-$RELEASE_VERSION-webview2-license.txt"
+          if find "$root" -type f \( -name '*.pom' -o -name '*.module' \) -exec grep -Il 'SNAPSHOT' {} + | grep -q .; then
+            echo 'SNAPSHOT metadata leaked into release repository' >&2
+            exit 1
+          fi
+
+      - name: Restore Maven Central credentials and signing key
+        shell: bash
+        env:
+          GRADLE_PROPERTIES_CONTENT: ${{ secrets.GRADLE_PROPERTIES_CONTENT }}
+          GPG_SECRET_KEY_RING_BASE64: ${{ secrets.GPG_SECRET_KEY_RING_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$GRADLE_PROPERTIES_CONTENT"
+          test -n "$GPG_SECRET_KEY_RING_BASE64"
+          gradle_dir="$HOME/.gradle"
+          properties_file="$gradle_dir/gradle.properties"
+          keyring="$gradle_dir/webview-kmp-secret-key.gpg"
+          mkdir -p "$gradle_dir"
+          printf '%s' "$GRADLE_PROPERTIES_CONTENT" > "$properties_file"
+          printf '%s' "$GPG_SECRET_KEY_RING_BASE64" | tr -d '\r\n ' | openssl base64 -d -A > "$keyring"
+          test -s "$keyring"
+          awk '!/^signing.secretKeyRingFile=/' "$properties_file" > "$properties_file.tmp"
+          mv "$properties_file.tmp" "$properties_file"
+          printf '\nsigning.secretKeyRingFile=%s\n' "$keyring" >> "$properties_file"
+          chmod 600 "$properties_file" "$keyring"
+          for property in mavenCentralUsername mavenCentralPassword signing.keyId signing.password; do
+            grep -Eq "^${property//./\\.}=.+" "$properties_file" || {
+              echo "GRADLE_PROPERTIES_CONTENT is missing required property '$property'" >&2
+              exit 1
+            }
+          done
+
+      - name: Sign and upload one Maven Central deployment
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/publish-maven-central-bundle.sh
+          scripts/publish-maven-central-bundle.sh \
+            "$GITHUB_WORKSPACE/release/merged" \
+            "$RELEASE_VERSION" \
+            "$GITHUB_WORKSPACE/release/webview-kmp-$RELEASE_VERSION.zip"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failed-webview-kmp-central-bundle-${{ needs.prepare.outputs.version }}
+          path: release/webview-kmp-${{ needs.prepare.outputs.version }}.zip
+          if-no-files-found: ignore
+          retention-days: 5

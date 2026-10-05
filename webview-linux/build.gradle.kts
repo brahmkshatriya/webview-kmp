@@ -2,7 +2,7 @@ plugins {
     kotlin("multiplatform")
     id("org.jetbrains.kotlin.plugin.compose")
     id("dev.brahmkshatriya.compose")
-    `maven-publish`
+    id("com.vanniktech.maven.publish")
 }
 
 val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()

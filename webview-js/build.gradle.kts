@@ -1,7 +1,7 @@
 plugins {
     kotlin("multiplatform")
     id("org.jetbrains.kotlin.plugin.compose")
-    `maven-publish`
+    id("com.vanniktech.maven.publish")
 }
 
 kotlin {

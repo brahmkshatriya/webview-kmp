@@ -2,7 +2,7 @@ plugins {
     kotlin("multiplatform")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.android.kotlin.multiplatform.library")
-    `maven-publish`
+    id("com.vanniktech.maven.publish")
 }
 
 kotlin {
