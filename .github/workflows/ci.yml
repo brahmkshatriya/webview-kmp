@@ -81,7 +81,7 @@ jobs:
       - name: Install Android SDK
         if: matrix.android == true
         shell: bash
-        run: sdkmanager 'platforms;android-37' 'build-tools;37.0.0'
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
 
       - name: Verify runner architecture
         if: matrix.expected_arch
