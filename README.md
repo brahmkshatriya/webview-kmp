@@ -13,7 +13,7 @@ Supported targets:
 | iOS | WKWebView |
 | macOS | WKWebView |
 | Windows | Microsoft Edge WebView2 Runtime |
-| Linux | An installed Chromium- or Firefox-based browser |
+| Linux | WPE WebKit by default; installed Chromium/Firefox are optional alternatives |
 | JavaScript | iframe |
 
 ## Add it to your project
@@ -164,8 +164,9 @@ This prevents the library from selecting an implementation that cannot provide t
 
 ## Choosing a browser on Linux
 
-Linux can use either a Chromium-based browser or a Firefox-based browser installed on the user's
-machine.
+By default, Linux uses the system WebView backend: WPE WebKit.
+
+You can also choose an installed Chromium-based or Firefox-based browser explicitly.
 
 To prefer Firefox:
 
@@ -189,7 +190,8 @@ val controller = rememberWebViewController(
 )
 ```
 
-By default, `WebViewBackendId.System` chooses an available browser automatically.
+`WebViewBackendId.System` always means WPE WebKit on Linux. It does not fall back to Chrome or
+Firefox.
 
 Common Chrome, Chromium, Edge, Brave, Vivaldi, Firefox, LibreWolf, Floorp, Waterfox, and Zen
 installations are detected automatically.
@@ -241,10 +243,12 @@ view support.
 
 ### Linux
 
-Requires a compatible Chromium- or Firefox-based browser to be installed on the system.
+The default `System` backend uses WPE WebKit. WPE WebKit must be installed on the build and target
+system.
 
-The browser runs with an isolated temporary profile, so it does not reuse or modify the user's normal
-browser profile.
+Chromium and Firefox are optional alternative backends. When one of those is selected, the browser
+runs with an isolated temporary profile, so it does not reuse or modify the user's normal browser
+profile.
 
 ### JavaScript
 
@@ -299,7 +303,8 @@ modules individually.
 
 ## Current status
 
-Linux has been runtime-tested with Chrome and Firefox.
+Linux has been runtime-tested with Chrome and Firefox. The WPE WebKit renderer is based on the
+runtime-tested Compose Native WPE integration and is compile/link-tested in this library.
 
 Android, JavaScript, Windows, iOS, and macOS implementations compile successfully. Windows, iOS,
 and macOS still need broader real-device/runtime testing before the library should be considered

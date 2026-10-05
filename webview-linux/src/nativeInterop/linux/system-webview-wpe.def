@@ -1,0 +1,5 @@
+headers = system_webview_wpe.h
+headerFilter = system_webview_wpe.h
+package = dev.brahmkshatriya.webview.internal.wpe
+compilerOpts = -Isrc/nativeInterop/linux/include
+linkerOpts = -lWPEWebKit-2.0 -lwpe-1.0 -lsoup-3.0 -lgio-2.0 -lgobject-2.0 -lgmodule-2.0 -lglib-2.0 -lEGL -lGL -lSDL3 -lstdc++ -lpthread

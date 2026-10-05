@@ -28,12 +28,12 @@ import platform.posix.getenv
 import platform.posix.getpid
 import platform.posix.system
 
-private enum class LinuxBrowserFamily {
+internal enum class LinuxBrowserFamily {
     Chromium,
     Firefox,
 }
 
-private data class LinuxBrowser(
+internal data class LinuxBrowser(
     val family: LinuxBrowserFamily,
     val executable: String,
 )
@@ -131,51 +131,7 @@ public object FirefoxWebViewBackend : WebViewBackendProvider {
         )
 }
 
-/**
- * Linux system backend. It embeds an installed browser through Wayland AppView, preferring a
- * Chromium-family browser and falling back to a Firefox-family browser.
- */
-public object SystemWebViewBackend : WebViewBackendProvider {
-    override val id: WebViewBackendId = WebViewBackendId.System
-    override val displayName: String = "Installed browser (Wayland AppView)"
-    override val capabilities: WebViewCapabilities =
-        WebViewCapabilities.of(
-            WebViewCapability.CustomRequestHeaders,
-            WebViewCapability.CustomUserAgent,
-            WebViewCapability.JavaScriptEvaluation,
-            WebViewCapability.CrossOriginJavaScriptEvaluation,
-            WebViewCapability.NavigationState,
-            WebViewCapability.LoadingProgress,
-            WebViewCapability.MediaPlaybackPolicy,
-        )
-
-    override fun availability(): WebViewBackendAvailability =
-        if (findPreferredBrowser() != null) {
-            WebViewBackendAvailability.Available
-        } else {
-            WebViewBackendAvailability.Unavailable(
-                "No supported Chromium-family or Firefox-family browser executable was found on PATH",
-            )
-        }
-
-    override fun create(config: WebViewConfig): WebViewController {
-        val browser =
-            if (config.javaScript == JavaScriptMode.Disabled) {
-                findBrowser(LinuxBrowserFamily.Firefox)
-                    ?: error("JavaScript-disabled mode requires an installed Firefox-family browser")
-            } else {
-                requireNotNull(findPreferredBrowser()) {
-                    "No supported Chromium-family or Firefox-family browser executable was found on PATH"
-                }
-            }
-        return BrowserAppViewController(id, browser, config)
-    }
-}
-
-public fun platformBackendProviders(): List<WebViewBackendProvider> =
-    listOf(ChromiumWebViewBackend, FirefoxWebViewBackend, SystemWebViewBackend)
-
-private class BrowserAppViewController(
+internal class BrowserAppViewController(
     override val backendId: WebViewBackendId,
     private val browser: LinuxBrowser,
     private val config: WebViewConfig,
@@ -451,9 +407,6 @@ private fun browserAvailability(
         WebViewBackendAvailability.Unavailable("No supported $family browser executable was found on PATH")
     }
 
-private fun findPreferredBrowser(): LinuxBrowser? =
-    findBrowser(LinuxBrowserFamily.Chromium) ?: findBrowser(LinuxBrowserFamily.Firefox)
-
 private fun findBrowser(family: LinuxBrowserFamily): LinuxBrowser? {
     val override =
         when (family) {
@@ -527,18 +480,14 @@ private fun escapeJavaScriptString(value: String): String =
     }
 
 @Composable
-public fun PlatformWebView(
-    controller: WebViewController,
+internal fun BrowserPlatformWebView(
+    controller: BrowserAppViewController,
     modifier: Modifier,
 ): Unit {
-    val appViewController =
-        controller as? BrowserAppViewController
-            ?: error("The selected Linux backend is not an AppView browser controller")
-
     EmbeddedWaylandAppView(
-        controller = appViewController.embeddedController,
+        controller = controller.embeddedController,
         modifier = modifier,
         onFullscreenRequest = {},
-        onStatusChange = appViewController::updateStatus,
+        onStatusChange = controller::updateStatus,
     )
 }

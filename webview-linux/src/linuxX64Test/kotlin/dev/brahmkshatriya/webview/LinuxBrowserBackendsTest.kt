@@ -2,12 +2,17 @@ package dev.brahmkshatriya.webview
 
 import kotlin.test.Test
 import kotlin.test.assertContains
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class LinuxBrowserBackendsTest {
     @Test
-    fun registersAppViewBrowserBackends() {
-        val ids = platformBackendProviders().map(WebViewBackendProvider::id)
+    fun registersSystemWebKitAndBrowserAlternatives() {
+        val providers = platformBackendProviders()
+        assertEquals(WebViewBackendId.System, providers.first().id)
+        assertEquals("WPE WebKit", SystemWebViewBackend.displayName)
+
+        val ids = providers.map(WebViewBackendProvider::id)
         assertContains(ids, WebViewBackendId.Chromium)
         assertContains(ids, WebViewBackendId.Firefox)
         assertContains(ids, WebViewBackendId.System)
