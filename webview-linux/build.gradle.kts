@@ -7,6 +7,7 @@ plugins {
 
 val composeNativeVersion = providers.gradleProperty("composeNativeVersion").orElse("1.13.0-alpha10").get()
 val waylandAppViewVersion = providers.gradleProperty("waylandAppViewVersion").orElse("0.1.0").get()
+val metadataOnly = providers.gradleProperty("webviewMetadataOnly").map(String::toBoolean).orElse(false).get()
 val linuxInteropDir = layout.projectDirectory.dir("src/nativeInterop/linux")
 val linuxInteropIncludeDir = linuxInteropDir.dir("include")
 val hostArchitecture = System.getProperty("os.arch").lowercase()
@@ -179,10 +180,12 @@ kotlin {
                 header(linuxInteropIncludeDir.file("system_webview_wpe.h").asFile)
                 includeDirs(linuxInteropIncludeDir.asFile)
                 packageName("dev.brahmkshatriya.webview.internal.wpe")
-                extraOpts(
-                    "-libraryPath", linuxX64BridgeDir.get().asFile.absolutePath,
-                    "-staticLibrary", "libwebview-kmp-wpe.a",
-                )
+                if (!metadataOnly) {
+                    extraOpts(
+                        "-libraryPath", linuxX64BridgeDir.get().asFile.absolutePath,
+                        "-staticLibrary", "libwebview-kmp-wpe.a",
+                    )
+                }
             }
         }
     }
@@ -193,10 +196,12 @@ kotlin {
                 header(linuxInteropIncludeDir.file("system_webview_wpe.h").asFile)
                 includeDirs(linuxInteropIncludeDir.asFile)
                 packageName("dev.brahmkshatriya.webview.internal.wpe")
-                extraOpts(
-                    "-libraryPath", linuxArm64BridgeDir.get().asFile.absolutePath,
-                    "-staticLibrary", "libwebview-kmp-wpe.a",
-                )
+                if (!metadataOnly) {
+                    extraOpts(
+                        "-libraryPath", linuxArm64BridgeDir.get().asFile.absolutePath,
+                        "-staticLibrary", "libwebview-kmp-wpe.a",
+                    )
+                }
             }
         }
     }
@@ -231,9 +236,9 @@ kotlin {
 }
 
 tasks.matching { it.name == "cinteropSystemWpeLinuxX64" }.configureEach {
-    dependsOn(archiveLinuxX64WpeBridge)
+    if (!metadataOnly) dependsOn(archiveLinuxX64WpeBridge)
 }
 
 tasks.matching { it.name == "cinteropSystemWpeLinuxArm64" }.configureEach {
-    dependsOn(archiveLinuxArm64WpeBridge)
+    if (!metadataOnly) dependsOn(archiveLinuxArm64WpeBridge)
 }

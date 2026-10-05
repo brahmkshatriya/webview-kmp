@@ -12,6 +12,7 @@ tasks="$*"
 
 docker run --rm \
     -e "ORG_GRADLE_PROJECT_VERSION_NAME=${ORG_GRADLE_PROJECT_VERSION_NAME:-}" \
+    -e "ORG_GRADLE_PROJECT_webviewMetadataOnly=${ORG_GRADLE_PROJECT_webviewMetadataOnly:-}" \
     -e "TARGET_TASKS=$tasks" \
     -v "$project_root:/workspace" \
     -w /workspace \
@@ -25,7 +26,8 @@ docker run --rm \
             openjdk-21-jdk-headless \
             build-essential pkg-config \
             libwpewebkit-2.0-dev libwpe-1.0-dev \
-            libsdl3-dev libegl-dev libgl-dev libxkbcommon-dev
+            libsdl3-dev libegl-dev libgl-dev libxkbcommon-dev \
+            libfontconfig1-dev libfreetype-dev libpng-dev
         export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
         export PATH="$JAVA_HOME/bin:$PATH"
         ./gradlew --no-daemon --stacktrace --no-configuration-cache $TARGET_TASKS

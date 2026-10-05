@@ -168,6 +168,7 @@ jobs:
         shell: bash
         env:
           ORG_GRADLE_PROJECT_VERSION_NAME: ${{ needs.prepare.outputs.version }}
+          ORG_GRADLE_PROJECT_webviewMetadataOnly: 'true'
         run: |
           set -euo pipefail
           rm -rf build/maven-release-shard
