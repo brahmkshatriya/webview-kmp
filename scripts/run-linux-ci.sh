@@ -40,5 +40,15 @@ docker run --rm \
             libfontconfig1-dev libfreetype-dev libpng-dev
         export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
         export PATH="$JAVA_HOME/bin:$PATH"
+
+        # Kotlin/Native does not run on Linux ARM64 hosts. ARM64 Linux artifacts are
+        # cross-compiled from x64. A first lightweight compilation downloads the
+        # ARM64 GCC/sysroot that the WPE native bridge discovers on the next Gradle
+        # configuration.
+        if [[ "$(uname -m)" == "x86_64" && "$TARGET_TASKS" == *LinuxArm64* ]]; then
+            ./gradlew --no-daemon --stacktrace --no-configuration-cache \
+                :webview-core:compileKotlinLinuxArm64
+        fi
+
         ./gradlew --no-daemon --stacktrace --no-configuration-cache $TARGET_TASKS
     '
