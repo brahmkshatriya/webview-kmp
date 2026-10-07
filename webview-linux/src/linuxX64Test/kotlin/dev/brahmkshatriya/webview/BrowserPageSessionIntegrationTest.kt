@@ -14,6 +14,9 @@ import platform.posix.getenv
 import platform.posix.getpid
 import platform.posix.system
 import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class BrowserPageSessionIntegrationTest {
     @Test
@@ -65,6 +68,77 @@ private suspend fun verifyPageSession(session: BrowserPageSession) {
     withHeaderEchoServer { baseUrl ->
         verifyCustomRequestHeadersContract(harness, baseUrl)
     }
+    withCookieEchoServer { baseUrl ->
+        verifyCookieStore(session, baseUrl)
+    }
+    verifyUserScripts(session)
+}
+
+private suspend fun verifyUserScripts(session: BrowserPageSession) {
+    session.installUserScripts(
+        listOf(
+            WebViewUserScript(
+                source = "window.webviewKmpStart = 'start-ok';",
+                injectionTime = WebViewUserScriptInjectionTime.DocumentStart,
+            ),
+            WebViewUserScript(
+                source = "document.body.dataset.webviewKmpEnd = 'end-ok';",
+                injectionTime = WebViewUserScriptInjectionTime.DocumentEnd,
+            ),
+        ),
+    )
+    val url =
+        "data:text/html,<title>Scripts</title><body>body<script>" +
+            "document.body.dataset.webviewKmpStart=window.webviewKmpStart||'missing'</script>"
+    session.navigate(url)
+    awaitPage(session) { it.url == url && !it.isLoading }
+    assertEquals(
+        JavaScriptResult.Value("\"start-ok\""),
+        session.evaluateJavaScript("document.body.dataset.webviewKmpStart"),
+    )
+    assertEquals(
+        JavaScriptResult.Value("\"end-ok\""),
+        session.evaluateJavaScript("document.body.dataset.webviewKmpEnd"),
+    )
+}
+
+private suspend fun verifyCookieStore(session: BrowserPageSession, baseUrl: String) {
+    val pageUrl = "$baseUrl/cookie"
+    val cookie =
+        WebViewCookie(
+            name = "webview_kmp_session",
+            value = "cookie-ok",
+            path = "/",
+            httpOnly = true,
+            sameSite = WebViewCookieSameSite.Lax,
+        )
+
+    session.clearCookies()
+    assertTrue(session.getCookies(pageUrl).isEmpty())
+
+    session.setCookie(baseUrl, cookie)
+    val stored = session.getCookies(pageUrl).single { it.name == cookie.name }
+    assertEquals(cookie.value, stored.value)
+    assertEquals(true, stored.httpOnly)
+
+    session.navigate(pageUrl)
+    awaitPage(session) { it.url == pageUrl && !it.isLoading }
+    assertEquals(
+        JavaScriptResult.Value("\"webview_kmp_session=cookie-ok\""),
+        session.evaluateJavaScript("document.body.textContent"),
+    )
+    val documentCookie = session.evaluateJavaScript("document.cookie")
+    assertTrue(documentCookie is JavaScriptResult.Value)
+    assertFalse(documentCookie.json.orEmpty().contains(cookie.name))
+
+    session.deleteCookie(baseUrl, stored)
+    assertTrue(session.getCookies(pageUrl).none { it.name == cookie.name })
+
+    session.setCookie(baseUrl, cookie.copy(name = "first"))
+    session.setCookie(baseUrl, cookie.copy(name = "second"))
+    assertTrue(session.getCookies(pageUrl).size >= 2)
+    session.clearCookies()
+    assertTrue(session.getCookies(pageUrl).isEmpty())
 }
 
 private fun BrowserPageSnapshot.toWebViewState(): WebViewState =
@@ -193,6 +267,52 @@ HTTPServer(("127.0.0.1", $port), Handler).serve_forever()
     delay(150)
     try {
         block("http://127.0.0.1:$port")
+    } finally {
+        system("kill $(cat ${testShellQuote(pidFile)}) 2>/dev/null || true")
+        system("rm -rf -- ${testShellQuote(root)}")
+    }
+}
+
+private suspend fun withCookieEchoServer(block: suspend (String) -> Unit) {
+    val python = requireNotNull(findTestExecutable(listOf("python3"))) {
+        "python3 is required for the Linux cookie integration test"
+    }
+    val port = allocateLoopbackPort()
+    val root = "/tmp/webview-kmp-cookie-test-${getpid()}-$port"
+    val script = "$root/server.py"
+    val pidFile = "$root/pid"
+    val logFile = "$root/server.log"
+    check(system("mkdir -p -- ${testShellQuote(root)}") == 0)
+    writeTestTextFile(
+        script,
+        """
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        value = self.headers.get("Cookie", "")
+        body = ("<title>Cookie Echo</title><body>" + value + "</body>").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", $port), Handler).serve_forever()
+""".trimIndent(),
+    )
+    check(
+        system(
+            "(${testShellQuote(python)} ${testShellQuote(script)} >${testShellQuote(logFile)} 2>&1 & " +
+                "echo $! >${testShellQuote(pidFile)})",
+        ) == 0,
+    ) { "Could not launch cookie echo server" }
+    delay(150)
+    try {
+        block("http://localhost:$port")
     } finally {
         system("kill $(cat ${testShellQuote(pidFile)}) 2>/dev/null || true")
         system("rm -rf -- ${testShellQuote(root)}")

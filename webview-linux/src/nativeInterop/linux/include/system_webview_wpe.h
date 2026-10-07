@@ -11,13 +11,33 @@ typedef void (*KtnWpeJavaScriptCallback)(
     int success,
     const char *value
 );
+typedef void (*KtnWpeCookieCallback)(
+    void *user_data,
+    int success,
+    const char *value
+);
+typedef void (*KtnWpeMessageCallback)(
+    void *user_data,
+    const char *data
+);
+typedef int (*KtnWpeNavigationCallback)(
+    void *user_data,
+    const char *url,
+    const char *method,
+    int is_main_frame,
+    int is_redirect,
+    int has_user_gesture
+);
 
 KtnWpeWebView *ktn_wpe_webview_create(
     const char *uri,
     int java_script_enabled,
     const char *user_agent,
     int media_playback_requires_user_gesture,
-    int debug_logging
+    int debug_logging,
+    int ephemeral_profile,
+    const char *data_directory,
+    const char *cache_directory
 );
 void ktn_wpe_webview_destroy(KtnWpeWebView *view);
 const char *ktn_wpe_webview_error(KtnWpeWebView *view);
@@ -63,6 +83,55 @@ void ktn_wpe_webview_evaluate_javascript(
     KtnWpeWebView *view,
     const char *script,
     KtnWpeJavaScriptCallback callback,
+    void *user_data
+);
+void ktn_wpe_webview_set_navigation_callback(
+    KtnWpeWebView *view,
+    KtnWpeNavigationCallback callback,
+    void *user_data
+);
+void ktn_wpe_webview_add_user_script(
+    KtnWpeWebView *view,
+    const char *source,
+    int injection_time,
+    int main_frame_only
+);
+void ktn_wpe_webview_set_message_callback(
+    KtnWpeWebView *view,
+    KtnWpeMessageCallback callback,
+    void *user_data
+);
+void ktn_wpe_webview_get_cookies(
+    KtnWpeWebView *view,
+    const char *uri,
+    KtnWpeCookieCallback callback,
+    void *user_data
+);
+void ktn_wpe_webview_set_cookie(
+    KtnWpeWebView *view,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    long long expires_at_millis,
+    int secure,
+    int http_only,
+    int same_site,
+    KtnWpeCookieCallback callback,
+    void *user_data
+);
+void ktn_wpe_webview_delete_cookie(
+    KtnWpeWebView *view,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    KtnWpeCookieCallback callback,
+    void *user_data
+);
+void ktn_wpe_webview_clear_cookies(
+    KtnWpeWebView *view,
+    KtnWpeCookieCallback callback,
     void *user_data
 );
 void ktn_wpe_webview_set_focused(KtnWpeWebView *view, int focused);

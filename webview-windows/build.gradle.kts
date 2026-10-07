@@ -16,6 +16,7 @@ plugins {
 
 val composeNativeVersion = providers.gradleProperty("composeNativeVersion").get()
 val webView2SdkVersion = providers.gradleProperty("webView2SdkVersion").get()
+val serializationJsonVersion = providers.gradleProperty("serializationJsonVersion").get()
 val webView2SdkPackage = providers.gradleProperty("webView2SdkPackage")
 val webView2SdkDir = layout.buildDirectory.dir("webview2-sdk/$webView2SdkVersion")
 val webView2IncludeDir = webView2SdkDir.map { it.dir("include") }
@@ -133,6 +134,7 @@ kotlin {
         }
         mingwX64Main.dependencies {
             api(project(":webview-core"))
+            implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationJsonVersion")
         }
     }
 }

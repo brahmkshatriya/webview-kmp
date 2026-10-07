@@ -19,5 +19,8 @@ class LinuxBrowserBackendsTest {
         assertTrue(WebViewCapability.CustomRequestHeaders in ChromiumWebViewBackend.capabilities)
         assertTrue(WebViewCapability.CustomRequestHeaders in FirefoxWebViewBackend.capabilities)
         assertTrue(WebViewCapability.CustomRequestHeaders in SystemWebViewBackend.capabilities)
+        assertTrue(WebViewCapability.Cookies in ChromiumWebViewBackend.capabilities)
+        assertTrue(WebViewCapability.Cookies in FirefoxWebViewBackend.capabilities)
+        assertTrue(WebViewCapability.Cookies in SystemWebViewBackend.capabilities)
     }
 }

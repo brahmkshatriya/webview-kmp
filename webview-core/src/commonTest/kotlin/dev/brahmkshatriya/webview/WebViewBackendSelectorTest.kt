@@ -56,6 +56,29 @@ public class WebViewBackendSelectorTest {
 
         assertEquals(WebViewBackendId("second"), controller.backendId)
     }
+
+    @Test
+    public fun canRequireCookieAccess(): Unit {
+        val first =
+            FakeProvider(
+                "first",
+                available = true,
+                capabilities = WebViewCapabilities.of(WebViewCapability.JavaScriptEvaluation),
+            )
+        val second =
+            FakeProvider(
+                "second",
+                available = true,
+                capabilities = WebViewCapabilities.of(WebViewCapability.Cookies),
+            )
+
+        val controller =
+            WebViewBackendSelector(listOf(first, second)).create(
+                requiredCapabilities = setOf(WebViewCapability.Cookies),
+            )
+
+        assertEquals(WebViewBackendId("second"), controller.backendId)
+    }
 }
 
 private class FakeProvider(

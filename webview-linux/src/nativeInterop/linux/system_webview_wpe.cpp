@@ -7,8 +7,10 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <SDL3/SDL.h>
+#include <gio/gio.h>
 #include <glib-object.h>
 #include <glib.h>
+#include <wpe/wpe-platform.h>
 #include <wpe/headless/wpe-headless.h>
 #include <wpe/WPEBufferDMABuf.h>
 #include <wpe/WPEBufferSHM.h>
@@ -25,6 +27,11 @@ struct KtnWpeWebView {
     WPEDisplay *display = nullptr;
     WPEView *wpe_view = nullptr;
     WebKitWebView *web_view = nullptr;
+    WebKitNetworkSession *owned_network_session = nullptr;
+    KtnWpeNavigationCallback navigation_callback = nullptr;
+    void *navigation_user_data = nullptr;
+    KtnWpeMessageCallback message_callback = nullptr;
+    void *message_user_data = nullptr;
     WPEBuffer *buffer = nullptr;
     GLuint texture = 0;
     GLuint framebuffer = 0;
@@ -49,6 +56,44 @@ struct KtnWpeJavaScriptRequest {
     KtnWpeJavaScriptCallback callback = nullptr;
     void *user_data = nullptr;
 };
+
+struct KtnWpeCookieRequest {
+    KtnWpeCookieCallback callback = nullptr;
+    void *user_data = nullptr;
+    SoupCookie *cookie = nullptr;
+};
+
+static std::string ktn_wpe_json_string(const char *value) {
+    if (!value) return "null";
+    std::string output = "\"";
+    for (const unsigned char ch : std::string(value)) {
+        switch (ch) {
+            case '\\': output += "\\\\"; break;
+            case '"': output += "\\\""; break;
+            case '\b': output += "\\b"; break;
+            case '\f': output += "\\f"; break;
+            case '\n': output += "\\n"; break;
+            case '\r': output += "\\r"; break;
+            case '\t': output += "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    char escaped[7] = {};
+                    std::snprintf(escaped, sizeof(escaped), "\\u%04x", ch);
+                    output += escaped;
+                } else {
+                    output.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    output += '"';
+    return output;
+}
+
+static WebKitCookieManager *ktn_wpe_webview_cookie_manager(KtnWpeWebView *view) {
+    if (!view || !view->web_view) return nullptr;
+    WebKitNetworkSession *session = webkit_web_view_get_network_session(view->web_view);
+    return session ? webkit_network_session_get_cookie_manager(session) : nullptr;
+}
 
 static SDL_Cursor *ktn_wpe_webview_system_cursor(SDL_SystemCursor type) {
     static SDL_Cursor *cursors[SDL_SYSTEM_CURSOR_COUNT] = {};
@@ -322,6 +367,66 @@ static gboolean ktn_wpe_webview_load_failed(
     return FALSE;
 }
 
+static gboolean ktn_wpe_webview_decide_policy(
+    WebKitWebView *,
+    WebKitPolicyDecision *decision,
+    WebKitPolicyDecisionType type,
+    gpointer data
+) {
+    auto *view = static_cast<KtnWpeWebView *>(data);
+    if (
+        !view ||
+        !view->navigation_callback ||
+        type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
+    ) return FALSE;
+
+    auto *navigation = WEBKIT_NAVIGATION_POLICY_DECISION(decision);
+    WebKitNavigationAction *action =
+        webkit_navigation_policy_decision_get_navigation_action(navigation);
+    WebKitURIRequest *request = action ? webkit_navigation_action_get_request(action) : nullptr;
+    const char *url = request ? webkit_uri_request_get_uri(request) : nullptr;
+    if (!url || !url[0]) return FALSE;
+    const char *method = request ? webkit_uri_request_get_http_method(request) : nullptr;
+    const char *frame_name = action ? webkit_navigation_action_get_frame_name(action) : nullptr;
+    const int result = view->navigation_callback(
+        view->navigation_user_data,
+        url,
+        method && method[0] ? method : "GET",
+        !frame_name || !frame_name[0],
+        action && webkit_navigation_action_is_redirect(action),
+        action && webkit_navigation_action_is_user_gesture(action)
+    );
+    if (result == 0) {
+        webkit_policy_decision_use(decision);
+        return TRUE;
+    }
+    if (result == 2) {
+        GError *error = nullptr;
+        if (!g_app_info_launch_default_for_uri(url, nullptr, &error) && view->debug) {
+            std::fprintf(
+                stderr,
+                "webview-kmp WPE: could not open URL externally: %s\n",
+                error ? error->message : "unknown error"
+            );
+        }
+        g_clear_error(&error);
+    }
+    webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
+static void ktn_wpe_webview_script_message(
+    WebKitUserContentManager *,
+    JSCValue *value,
+    gpointer data
+) {
+    auto *view = static_cast<KtnWpeWebView *>(data);
+    if (!view || !view->message_callback || !value) return;
+    char *text = jsc_value_to_string(value);
+    view->message_callback(view->message_user_data, text ? text : "");
+    g_free(text);
+}
+
 static void ktn_wpe_webview_javascript_finished(
     GObject *source,
     GAsyncResult *result,
@@ -351,6 +456,121 @@ static void ktn_wpe_webview_javascript_finished(
     if (request->callback) request->callback(request->user_data, 1, serialized);
     g_free(serialized);
     if (value) g_object_unref(value);
+    delete request;
+}
+
+static void ktn_wpe_webview_get_cookies_finished(
+    GObject *source,
+    GAsyncResult *result,
+    gpointer data
+) {
+    auto *request = static_cast<KtnWpeCookieRequest *>(data);
+    if (!request) return;
+    GError *error = nullptr;
+    GList *cookies = webkit_cookie_manager_get_cookies_finish(
+        WEBKIT_COOKIE_MANAGER(source),
+        result,
+        &error
+    );
+    if (error) {
+        if (request->callback) request->callback(request->user_data, 0, error->message);
+        g_error_free(error);
+        delete request;
+        return;
+    }
+
+    std::string json = "[";
+    bool first = true;
+    for (GList *node = cookies; node; node = node->next) {
+        auto *cookie = static_cast<SoupCookie *>(node->data);
+        if (!cookie) continue;
+        if (!first) json += ',';
+        first = false;
+        GDateTime *expires = soup_cookie_get_expires(cookie);
+        const long long expires_millis = expires
+            ? static_cast<long long>(g_date_time_to_unix(expires)) * 1000LL
+            : -1LL;
+        json += "{\"name\":" + ktn_wpe_json_string(soup_cookie_get_name(cookie));
+        json += ",\"value\":" + ktn_wpe_json_string(soup_cookie_get_value(cookie));
+        json += ",\"domain\":" + ktn_wpe_json_string(soup_cookie_get_domain(cookie));
+        json += ",\"path\":" + ktn_wpe_json_string(soup_cookie_get_path(cookie));
+        json += ",\"expiresAtMillis\":" + std::to_string(expires_millis);
+        json += ",\"secure\":" + std::string(soup_cookie_get_secure(cookie) ? "true" : "false");
+        json += ",\"httpOnly\":" + std::string(soup_cookie_get_http_only(cookie) ? "true" : "false");
+        json += ",\"sameSite\":" + std::to_string(static_cast<int>(soup_cookie_get_same_site_policy(cookie)));
+        json += '}';
+    }
+    json += ']';
+    if (request->callback) request->callback(request->user_data, 1, json.c_str());
+    if (cookies) g_list_free_full(cookies, reinterpret_cast<GDestroyNotify>(soup_cookie_free));
+    delete request;
+}
+
+static void ktn_wpe_webview_add_cookie_finished(
+    GObject *source,
+    GAsyncResult *result,
+    gpointer data
+) {
+    auto *request = static_cast<KtnWpeCookieRequest *>(data);
+    if (!request) return;
+    GError *error = nullptr;
+    const gboolean ok = webkit_cookie_manager_add_cookie_finish(
+        WEBKIT_COOKIE_MANAGER(source), result, &error
+    );
+    if (request->callback) {
+        request->callback(
+            request->user_data,
+            ok && !error ? 1 : 0,
+            error ? error->message : nullptr
+        );
+    }
+    if (error) g_error_free(error);
+    if (request->cookie) soup_cookie_free(request->cookie);
+    delete request;
+}
+
+static void ktn_wpe_webview_delete_cookie_finished(
+    GObject *source,
+    GAsyncResult *result,
+    gpointer data
+) {
+    auto *request = static_cast<KtnWpeCookieRequest *>(data);
+    if (!request) return;
+    GError *error = nullptr;
+    const gboolean ok = webkit_cookie_manager_delete_cookie_finish(
+        WEBKIT_COOKIE_MANAGER(source), result, &error
+    );
+    if (request->callback) {
+        request->callback(
+            request->user_data,
+            ok && !error ? 1 : 0,
+            error ? error->message : nullptr
+        );
+    }
+    if (error) g_error_free(error);
+    if (request->cookie) soup_cookie_free(request->cookie);
+    delete request;
+}
+
+static void ktn_wpe_webview_clear_cookies_finished(
+    GObject *source,
+    GAsyncResult *result,
+    gpointer data
+) {
+    auto *request = static_cast<KtnWpeCookieRequest *>(data);
+    if (!request) return;
+    GError *error = nullptr;
+    const gboolean ok = webkit_cookie_manager_replace_cookies_finish(
+        WEBKIT_COOKIE_MANAGER(source), result, &error
+    );
+    if (request->callback) {
+        request->callback(
+            request->user_data,
+            ok && !error ? 1 : 0,
+            error ? error->message : nullptr
+        );
+    }
+    if (error) g_error_free(error);
     delete request;
 }
 
@@ -406,6 +626,22 @@ static unsigned int ktn_wpe_webview_keysym(long long key, unsigned int code_poin
     }
 }
 
+static void ktn_wpe_webview_sync_system_clipboard_to_wpe(KtnWpeWebView *view) {
+    if (!view || !view->display) return;
+
+    char *text = SDL_GetClipboardText();
+    if (!text) return;
+
+    WPEClipboard *clipboard = wpe_display_get_clipboard(view->display);
+    if (clipboard) {
+        WPEClipboardContent *content = wpe_clipboard_content_new();
+        wpe_clipboard_content_set_text(content, text);
+        wpe_clipboard_set_content(clipboard, content);
+        wpe_clipboard_content_unref(content);
+    }
+    SDL_free(text);
+}
+
 static const char *ktn_wpe_webview_current_drm_device(EGLDisplay display) {
     auto query_display = reinterpret_cast<PFNEGLQUERYDISPLAYATTRIBEXTPROC>(
         eglGetProcAddress("eglQueryDisplayAttribEXT")
@@ -433,7 +669,10 @@ KtnWpeWebView *ktn_wpe_webview_create(
     int java_script_enabled,
     const char *user_agent,
     int media_playback_requires_user_gesture,
-    int debug_logging
+    int debug_logging,
+    int ephemeral_profile,
+    const char *data_directory,
+    const char *cache_directory
 ) {
     KtnWpeWebView *view = new KtnWpeWebView();
     view->debug = debug_logging != 0;
@@ -458,11 +697,26 @@ KtnWpeWebView *ktn_wpe_webview_create(
         g_clear_error(&display_error);
         return view;
     }
-    view->web_view = WEBKIT_WEB_VIEW(g_object_new(
-        WEBKIT_TYPE_WEB_VIEW,
-        "display", view->display,
-        nullptr
-    ));
+    if (ephemeral_profile) {
+        view->owned_network_session = webkit_network_session_new_ephemeral();
+    } else if (data_directory && data_directory[0]) {
+        view->owned_network_session = webkit_network_session_new(
+            data_directory,
+            cache_directory && cache_directory[0] ? cache_directory : nullptr
+        );
+    }
+    view->web_view = view->owned_network_session
+        ? WEBKIT_WEB_VIEW(g_object_new(
+            WEBKIT_TYPE_WEB_VIEW,
+            "display", view->display,
+            "network-session", view->owned_network_session,
+            nullptr
+        ))
+        : WEBKIT_WEB_VIEW(g_object_new(
+            WEBKIT_TYPE_WEB_VIEW,
+            "display", view->display,
+            nullptr
+        ));
     if (!view->web_view) {
         ktn_wpe_webview_set_error(view, "Could not create the WPE WebKit web view");
         return view;
@@ -505,6 +759,22 @@ KtnWpeWebView *ktn_wpe_webview_create(
     webkit_settings_set_enable_write_console_messages_to_stdout(settings, view->debug);
     g_signal_connect(view->web_view, "load-changed", G_CALLBACK(ktn_wpe_webview_load_changed), view);
     g_signal_connect(view->web_view, "load-failed", G_CALLBACK(ktn_wpe_webview_load_failed), view);
+    g_signal_connect(view->web_view, "decide-policy", G_CALLBACK(ktn_wpe_webview_decide_policy), view);
+    WebKitUserContentManager *content_manager =
+        webkit_web_view_get_user_content_manager(view->web_view);
+    if (content_manager) {
+        g_signal_connect(
+            content_manager,
+            "script-message-received::webviewKmp",
+            G_CALLBACK(ktn_wpe_webview_script_message),
+            view
+        );
+        webkit_user_content_manager_register_script_message_handler(
+            content_manager,
+            "webviewKmp",
+            nullptr
+        );
+    }
     if (view->debug) {
         std::fprintf(stderr, "webview-kmp WPE: user agent: %s\n", webkit_settings_get_user_agent(settings));
     }
@@ -530,7 +800,20 @@ void ktn_wpe_webview_destroy(KtnWpeWebView *view) {
     ktn_wpe_webview_release_buffer(view);
     if (view->framebuffer) glDeleteFramebuffers(1, &view->framebuffer);
     if (view->texture) glDeleteTextures(1, &view->texture);
-    if (view->web_view) g_object_unref(view->web_view);
+    if (view->web_view) {
+        WebKitUserContentManager *content_manager =
+            webkit_web_view_get_user_content_manager(view->web_view);
+        if (content_manager) {
+            webkit_user_content_manager_unregister_script_message_handler(
+                content_manager,
+                "webviewKmp",
+                nullptr
+            );
+            g_signal_handlers_disconnect_by_data(content_manager, view);
+        }
+        g_object_unref(view->web_view);
+    }
+    if (view->owned_network_session) g_object_unref(view->owned_network_session);
     if (view->display) g_object_unref(view->display);
     delete view;
 }
@@ -736,6 +1019,186 @@ void ktn_wpe_webview_evaluate_javascript(
     );
 }
 
+void ktn_wpe_webview_set_navigation_callback(
+    KtnWpeWebView *view,
+    KtnWpeNavigationCallback callback,
+    void *user_data
+) {
+    if (!view) return;
+    view->navigation_callback = callback;
+    view->navigation_user_data = user_data;
+}
+
+void ktn_wpe_webview_add_user_script(
+    KtnWpeWebView *view,
+    const char *source,
+    int injection_time,
+    int main_frame_only
+) {
+    if (!view || !view->web_view || !source || !source[0]) return;
+    WebKitUserContentManager *manager = webkit_web_view_get_user_content_manager(view->web_view);
+    if (!manager) return;
+    WebKitUserScript *script = webkit_user_script_new(
+        source,
+        main_frame_only
+            ? WEBKIT_USER_CONTENT_INJECT_TOP_FRAME
+            : WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        injection_time == 0
+            ? WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START
+            : WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+        nullptr,
+        nullptr
+    );
+    if (!script) return;
+    webkit_user_content_manager_add_script(manager, script);
+    webkit_user_script_unref(script);
+}
+
+void ktn_wpe_webview_set_message_callback(
+    KtnWpeWebView *view,
+    KtnWpeMessageCallback callback,
+    void *user_data
+) {
+    if (!view) return;
+    view->message_callback = callback;
+    view->message_user_data = user_data;
+}
+
+void ktn_wpe_webview_get_cookies(
+    KtnWpeWebView *view,
+    const char *uri,
+    KtnWpeCookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    WebKitCookieManager *manager = ktn_wpe_webview_cookie_manager(view);
+    if (!manager || !uri) {
+        callback(user_data, 0, "WPE WebKit cookie manager is not ready");
+        return;
+    }
+    auto *request = new KtnWpeCookieRequest();
+    request->callback = callback;
+    request->user_data = user_data;
+    webkit_cookie_manager_get_cookies(
+        manager,
+        uri,
+        nullptr,
+        ktn_wpe_webview_get_cookies_finished,
+        request
+    );
+}
+
+void ktn_wpe_webview_set_cookie(
+    KtnWpeWebView *view,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    long long expires_at_millis,
+    int secure,
+    int http_only,
+    int same_site,
+    KtnWpeCookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    WebKitCookieManager *manager = ktn_wpe_webview_cookie_manager(view);
+    if (!manager || !name || !value || !domain) {
+        callback(user_data, 0, "Invalid WPE WebKit cookie");
+        return;
+    }
+    SoupCookie *cookie = soup_cookie_new(name, value, domain, path && path[0] ? path : "/", -1);
+    if (!cookie) {
+        callback(user_data, 0, "Could not create WPE WebKit cookie");
+        return;
+    }
+    if (expires_at_millis >= 0) {
+        GDateTime *expires = g_date_time_new_from_unix_utc(expires_at_millis / 1000LL);
+        if (expires) {
+            soup_cookie_set_expires(cookie, expires);
+            g_date_time_unref(expires);
+        }
+    }
+    if (secure >= 0) soup_cookie_set_secure(cookie, secure != 0);
+    if (http_only >= 0) soup_cookie_set_http_only(cookie, http_only != 0);
+    if (same_site >= 0 && same_site <= 2) {
+        soup_cookie_set_same_site_policy(cookie, static_cast<SoupSameSitePolicy>(same_site));
+    }
+    auto *request = new KtnWpeCookieRequest();
+    request->callback = callback;
+    request->user_data = user_data;
+    request->cookie = cookie;
+    webkit_cookie_manager_add_cookie(
+        manager,
+        cookie,
+        nullptr,
+        ktn_wpe_webview_add_cookie_finished,
+        request
+    );
+}
+
+void ktn_wpe_webview_delete_cookie(
+    KtnWpeWebView *view,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    KtnWpeCookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    WebKitCookieManager *manager = ktn_wpe_webview_cookie_manager(view);
+    if (!manager || !name || !domain) {
+        callback(user_data, 0, "Invalid WPE WebKit cookie deletion");
+        return;
+    }
+    SoupCookie *cookie = soup_cookie_new(
+        name,
+        value ? value : "",
+        domain,
+        path && path[0] ? path : "/",
+        -1
+    );
+    if (!cookie) {
+        callback(user_data, 0, "Could not create WPE WebKit cookie deletion");
+        return;
+    }
+    auto *request = new KtnWpeCookieRequest();
+    request->callback = callback;
+    request->user_data = user_data;
+    request->cookie = cookie;
+    webkit_cookie_manager_delete_cookie(
+        manager,
+        cookie,
+        nullptr,
+        ktn_wpe_webview_delete_cookie_finished,
+        request
+    );
+}
+
+void ktn_wpe_webview_clear_cookies(
+    KtnWpeWebView *view,
+    KtnWpeCookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    WebKitCookieManager *manager = ktn_wpe_webview_cookie_manager(view);
+    if (!manager) {
+        callback(user_data, 0, "WPE WebKit cookie manager is not ready");
+        return;
+    }
+    auto *request = new KtnWpeCookieRequest();
+    request->callback = callback;
+    request->user_data = user_data;
+    webkit_cookie_manager_replace_cookies(
+        manager,
+        nullptr,
+        nullptr,
+        ktn_wpe_webview_clear_cookies_finished,
+        request
+    );
+}
+
 void ktn_wpe_webview_set_focused(KtnWpeWebView *view, int focused) {
     if (!view || !view->wpe_view) return;
     if (focused) wpe_view_focus_in(view->wpe_view);
@@ -840,6 +1303,14 @@ void ktn_wpe_webview_key(
         (modifiers & WPE_MODIFIER_KEYBOARD_CONTROL) &&
         !(modifiers & WPE_MODIFIER_KEYBOARD_ALT);
     const bool meta_shortcut = modifiers & WPE_MODIFIER_KEYBOARD_META;
+
+    // The offscreen backend uses a headless WPE display, so WebKit's clipboard is not connected
+    // to the SDL window's desktop clipboard. Populate the WPE clipboard immediately before a
+    // paste shortcut and then let WebKit process Ctrl+V normally.
+    if (pressed && control_shortcut && compose_key == 9) {
+        ktn_wpe_webview_sync_system_clipboard_to_wpe(view);
+    }
+
     if (
         !code_point &&
         ktn_wpe_webview_is_printable_key(compose_key) &&

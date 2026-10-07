@@ -10,6 +10,16 @@ public enum class WebViewCapability {
     LoadingProgress,
     JavaScriptControl,
     MediaPlaybackPolicy,
+    /** Native browser-cookie access, including cookies unavailable to page JavaScript. */
+    Cookies,
+    /** Ability to allow/cancel top-level and subresource navigation before it commits. */
+    NavigationInterception,
+    /** Automatic page-script injection configured through [WebViewConfig.userScripts]. */
+    UserScripts,
+    /** Isolated or named WebView profiles beyond the platform default profile. */
+    Profiles,
+    /** Bidirectional page/app messaging through the webview-kmp bridge. */
+    WebMessaging,
 }
 
 /** Immutable feature set reported by a backend or controller. */

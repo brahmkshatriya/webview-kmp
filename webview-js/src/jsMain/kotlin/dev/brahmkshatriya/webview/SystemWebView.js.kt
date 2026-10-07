@@ -24,6 +24,15 @@ public object SystemWebViewBackend : WebViewBackendProvider {
         require(config.userAgent == UserAgent.Default) {
             "A browser iframe cannot override the browser user agent"
         }
+        require(config.profile == WebViewProfile.Default) {
+            "Browser iframes do not expose independent WebView profiles"
+        }
+        require(config.navigationHandler == null) {
+            "Browser iframes cannot reliably intercept cross-origin navigation"
+        }
+        require(config.userScripts.isEmpty()) {
+            "Browser iframes cannot inject scripts into arbitrary cross-origin pages"
+        }
         return SystemWebViewController(config)
     }
 }

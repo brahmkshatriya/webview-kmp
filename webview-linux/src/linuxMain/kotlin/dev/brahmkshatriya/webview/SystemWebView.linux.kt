@@ -83,6 +83,9 @@ public object ChromiumWebViewBackend : WebViewBackendProvider {
             WebViewCapability.NavigationState,
             WebViewCapability.LoadingProgress,
             WebViewCapability.MediaPlaybackPolicy,
+            WebViewCapability.Cookies,
+            WebViewCapability.UserScripts,
+            WebViewCapability.Profiles,
         )
 
     override fun availability(): WebViewBackendAvailability =
@@ -97,6 +100,9 @@ public object ChromiumWebViewBackend : WebViewBackendProvider {
             config = config.also {
                 require(it.javaScript == JavaScriptMode.Enabled) {
                     "JavaScript-disabled mode is not supported by the Chromium AppView backend"
+                }
+                require(it.navigationHandler == null) {
+                    "Navigation interception is not supported by the Chromium AppView backend; use the WPE system backend"
                 }
             },
         )
@@ -116,6 +122,9 @@ public object FirefoxWebViewBackend : WebViewBackendProvider {
             WebViewCapability.LoadingProgress,
             WebViewCapability.JavaScriptControl,
             WebViewCapability.MediaPlaybackPolicy,
+            WebViewCapability.Cookies,
+            WebViewCapability.UserScripts,
+            WebViewCapability.Profiles,
         )
 
     override fun availability(): WebViewBackendAvailability =
@@ -127,7 +136,11 @@ public object FirefoxWebViewBackend : WebViewBackendProvider {
             browser = requireNotNull(findBrowser(LinuxBrowserFamily.Firefox)) {
                 "No supported Firefox-family browser executable was found on PATH"
             },
-            config = config,
+            config = config.also {
+                require(it.navigationHandler == null) {
+                    "Navigation interception is not supported by the Firefox AppView backend; use the WPE system backend"
+                }
+            },
         )
 }
 
@@ -137,7 +150,8 @@ internal class BrowserAppViewController(
     private val config: WebViewConfig,
 ) : WebViewController {
     private val appView = WaylandAppViewController()
-    private val profileDirectory = nextProfileDirectory(browser.family)
+    private val profileDirectory = profileDirectory(browser.family, config.profile)
+    private val deleteProfileOnClose = config.profile !is WebViewProfile.Persistent
     private val remoteDebuggingPort = allocateLoopbackPort()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sessionReady = CompletableDeferred<BrowserPageSession>()
@@ -153,6 +167,23 @@ internal class BrowserAppViewController(
     override val states: StateFlow<WebViewState> = mutableStates
     override val state: WebViewState
         get() = mutableStates.value
+    override val profile: WebViewProfile = config.profile
+    override val cookies: WebViewCookieStore = object : WebViewCookieStore {
+        override suspend fun get(url: String): List<WebViewCookie> =
+            sessionReady.await().getCookies(url)
+
+        override suspend fun set(url: String, cookie: WebViewCookie) {
+            sessionReady.await().setCookie(url, cookie)
+        }
+
+        override suspend fun delete(url: String, cookie: WebViewCookie) {
+            sessionReady.await().deleteCookie(url, cookie)
+        }
+
+        override suspend fun clear() {
+            sessionReady.await().clearCookies()
+        }
+    }
 
     internal val embeddedController: WaylandAppViewController
         get() = appView
@@ -164,7 +195,7 @@ internal class BrowserAppViewController(
         configureProfile()
         val initialUrl = config.initialUrl ?: "about:blank"
         mutableStates.value = WebViewState(url = initialUrl, isLoading = true)
-        if (!appView.launch(browserCommand(initialUrl))) {
+        if (!appView.launch(browserCommand("about:blank"))) {
             val failure = IllegalStateException(appView.error ?: "Failed to launch ${browser.executable}")
             mutableStates.value = mutableStates.value.copy(isLoading = false, error = failure.message)
             sessionReady.completeExceptionally(failure)
@@ -174,10 +205,11 @@ internal class BrowserAppViewController(
                     val session =
                         when (browser.family) {
                             LinuxBrowserFamily.Chromium ->
-                                connectChromiumPageSession(remoteDebuggingPort, initialUrl)
+                                connectChromiumPageSession(remoteDebuggingPort, "about:blank")
                             LinuxBrowserFamily.Firefox ->
-                                connectFirefoxPageSession(remoteDebuggingPort, initialUrl)
+                                connectFirefoxPageSession(remoteDebuggingPort, "about:blank")
                         }
+                    session.installUserScripts(config.userScripts)
                     session.initialize(initialUrl)
                     pageSession = session
                     sessionReady.complete(session)
@@ -261,7 +293,7 @@ internal class BrowserAppViewController(
         pageSession?.close()
         pageSession = null
         appView.close()
-        system("rm -rf -- ${shellQuote(profileDirectory)}")
+        if (deleteProfileOnClose) system("rm -rf -- ${shellQuote(profileDirectory)}")
     }
 
     internal fun updateStatus(status: WaylandAppViewStatus): Unit {
@@ -443,7 +475,21 @@ private fun findExecutable(name: String): String? {
 
 private var browserProfileSerial: Int = 0
 
-private fun nextProfileDirectory(family: LinuxBrowserFamily): String {
+private fun profileDirectory(
+    family: LinuxBrowserFamily,
+    profile: WebViewProfile,
+): String {
+    if (profile is WebViewProfile.Persistent) {
+        val dataHome =
+            getenv("XDG_DATA_HOME")?.toKString()?.takeIf(String::isNotBlank)
+                ?: getenv("HOME")?.toKString()?.let { "$it/.local/share" }
+                ?: "/tmp"
+        val safeName =
+            profile.name.map { char ->
+                if (char.isLetterOrDigit() || char == '.' || char == '_' || char == '-') char else '_'
+            }.joinToString("")
+        return "$dataHome/webview-kmp/profiles/${family.name.lowercase()}/$safeName"
+    }
     val serial = browserProfileSerial++
     return "/tmp/webview-kmp-${family.name.lowercase()}-${getpid()}-$serial"
 }

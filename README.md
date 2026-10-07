@@ -4,43 +4,34 @@
 
 A Kotlin Multiplatform WebView for Compose.
 
-`webview-kmp` uses the browser engine that is already available on each platform. It does not bundle
-Chromium, WebKit, Firefox, or another browser engine into your app.
-
-Supported targets:
-
-| Platform | What it uses |
-| --- | --- |
-| Android | Android WebView |
-| iOS | WKWebView |
-| macOS | WKWebView |
-| Windows | Microsoft Edge WebView2 Runtime |
-| Linux | WPE WebKit by default; installed Chromium/Firefox are optional alternatives |
-| JavaScript | iframe |
+It uses the browser engine already available on each platform. It does not bundle Chromium, WebKit, Firefox, or another browser engine into your app.
 
 ## Add it to your project
 
-For most projects, add only `webview-compose` to `commonMain`:
+For most apps, add only `webview-compose` to `commonMain`:
 
 ```kotlin
 kotlin {
-    sourceSets {
-        commonMain.dependencies {
-            implementation("dev.brahmkshatriya.webview:webview-compose:<version>")
-        }
+    sourceSets.commonMain.dependencies {
+        implementation("dev.brahmkshatriya.webview:webview-compose:<version>")
     }
 }
 ```
 
-That is enough even if your project targets several platforms.
+You do not need to add each platform implementation yourself. Gradle selects the implementations needed by your targets.
 
-You do **not** need to add Android, Linux, macOS, Windows, and other implementations separately.
-Gradle selects only the implementation needed by each target in your project.
+## Quick start
 
-For example, an Android + iOS project will not pull in the Linux or Windows implementation. A
-Windows-only project will not pull in Linux browser dependencies.
+For a simple page:
 
-## Basic usage
+```kotlin
+WebView(
+    url = "https://example.com",
+    modifier = Modifier.fillMaxSize(),
+)
+```
+
+Use a controller when you need navigation, state, JavaScript, cookies, profiles, or messaging:
 
 ```kotlin
 @Composable
@@ -58,11 +49,11 @@ fun Browser() {
 }
 ```
 
-`rememberWebViewController` automatically closes the WebView when it leaves the composition.
+`rememberWebViewController` closes the WebView automatically when it leaves the composition.
 
-## Navigation
+## Everyday API
 
-The controller can be used from your UI code:
+Navigation:
 
 ```kotlin
 controller.loadUrl("https://example.com")
@@ -72,7 +63,7 @@ controller.goBack()
 controller.goForward()
 ```
 
-You can also load HTML directly:
+Load HTML:
 
 ```kotlin
 controller.loadHtml(
@@ -81,107 +72,216 @@ controller.loadHtml(
 )
 ```
 
-## Reading WebView state
-
-The current state is available as both a snapshot and a `StateFlow`:
+Read state in Compose:
 
 ```kotlin
-val state = controller.state
+val state by controller.collectState()
 
-println(state.url)
-println(state.title)
-println(state.isLoading)
-println(state.progress)
-println(state.canGoBack)
-println(state.canGoForward)
-```
-
-In Compose:
-
-```kotlin
-val state by controller.states.collectAsState()
+Text(state.title.orEmpty())
 
 if (state.isLoading) {
     LinearProgressIndicator(progress = { state.progress })
 }
 ```
 
+The state also includes the current URL and back/forward availability.
+
 ## JavaScript
 
+From a coroutine:
+
 ```kotlin
-controller.evaluateJavaScript("document.title") { result ->
-    when (result) {
-        is JavaScriptResult.Value -> println(result.value)
-        is JavaScriptResult.Error -> println(result.message)
-    }
+when (val result = controller.evaluateJavaScript("document.title")) {
+    is JavaScriptResult.Value -> println(result.json)
+    is JavaScriptResult.Error -> println(result.message)
 }
 ```
 
-JavaScript can also be disabled when creating the controller:
+Useful navigation helpers:
+
+```kotlin
+controller.loadUrl("https://example.com/login")
+
+val callbackUrl = controller.awaitUrl {
+    it.startsWith("https://example.com/callback")
+}
+
+controller.awaitLoaded()
+```
+
+For event-style handling, collect `controller.events`.
+
+## Profiles
+
+Profiles let you choose how browser data is shared and persisted:
+
+```kotlin
+WebViewConfig(
+    profile = WebViewProfile.Default,
+)
+```
+
+Available modes:
+
+```kotlin
+WebViewProfile.Default
+WebViewProfile.Ephemeral
+WebViewProfile.Persistent("account-a")
+```
+
+- `Default` uses the backend's normal app-owned browser session.
+- `Ephemeral` keeps the session isolated and disposable.
+- `Persistent(name)` gives you a stable isolated profile for that name.
+
+Named persistent profiles are supported by WPE WebKit, Linux Chromium/Firefox, Windows WebView2, Android WebView when AndroidX WebKit multi-profile support is available, and Apple WKWebView on iOS 17+ / macOS 14+.
+
+## Cookies
+
+Use the cookie jar attached to the controller's profile:
+
+```kotlin
+controller.cookies.set(
+    url = "https://example.com",
+    cookie = WebViewCookie(
+        name = "session",
+        value = "value",
+        secure = true,
+        httpOnly = true,
+    ),
+)
+
+val cookies = controller.cookies.get("https://example.com")
+controller.cookies.clear()
+```
+
+If your app requires cookie access, request it when creating the controller:
+
+```kotlin
+val controller = rememberWebViewController(
+    requiredCapabilities = setOf(WebViewCapability.Cookies),
+)
+```
+
+Android may not expose all cookie metadata when reading cookies, so some fields can be `null`. The JavaScript iframe backend does not provide native cookie access.
+
+## Web messaging
+
+On supported native backends, page JavaScript can send a string to the app:
+
+```javascript
+window.webviewKmp.postMessage("ready")
+```
+
+Receive it in Kotlin:
+
+```kotlin
+controller.messages.collect { message ->
+    println(message.data)
+}
+```
+
+Send a message back:
+
+```kotlin
+controller.postMessage("refresh")
+```
+
+The page can receive app messages through `window.webviewKmp.onmessage` or the `webview-kmp-message` window event.
+
+## Navigation interception
+
+Use a navigation handler for callback URLs, custom schemes, or links that should leave the WebView:
 
 ```kotlin
 val controller = rememberWebViewController(
     config = WebViewConfig(
-        javaScript = JavaScriptMode.Disabled,
+        initialUrl = loginUrl,
+        navigationHandler = WebViewNavigationHandler { request ->
+            when {
+                request.url.startsWith(callbackUrl) ->
+                    WebViewNavigationDecision.Cancel
+
+                request.url.startsWith("mailto:") ->
+                    WebViewNavigationDecision.OpenExternally
+
+                else ->
+                    WebViewNavigationDecision.Allow
+            }
+        },
+    ),
+    requiredCapabilities = setOf(
+        WebViewCapability.NavigationInterception,
     ),
 )
 ```
 
-## Custom user agent
+Navigation interception is currently provided by Android WebView, WKWebView, WPE WebKit, and WebView2.
+
+## User scripts
+
+Install JavaScript that should run on each page:
 
 ```kotlin
 val controller = rememberWebViewController(
     config = WebViewConfig(
-        userAgent = UserAgent.Custom("MyApp"),
+        initialUrl = "https://example.com",
+        userScripts = listOf(
+            WebViewUserScript(
+                source = "window.myApp = { ready: true }",
+                injectionTime = WebViewUserScriptInjectionTime.DocumentStart,
+            ),
+        ),
     ),
 )
 ```
 
-## Request headers
+Request `WebViewCapability.UserScripts` when this is required.
 
-Platforms that support custom navigation headers can use:
+## Other configuration
+
+Custom user agent:
+
+```kotlin
+WebViewConfig(
+    userAgent = UserAgent.Custom("MyApp"),
+)
+```
+
+Disable JavaScript:
+
+```kotlin
+WebViewConfig(
+    javaScript = JavaScriptMode.Disabled,
+)
+```
+
+Custom navigation headers where supported:
 
 ```kotlin
 controller.loadUrl(
     url = "https://example.com",
-    headers = mapOf(
-        "Authorization" to "Bearer token",
-    ),
+    headers = mapOf("X-App-Version" to "1"),
 )
 ```
 
-If your app requires a feature that is not available everywhere, you can ask for it when creating
-the controller:
+When a feature is mandatory, list it in `requiredCapabilities`. The library will avoid selecting a backend that cannot provide it.
 
-```kotlin
-val controller = rememberWebViewController(
-    requiredCapabilities = setOf(
-        WebViewCapability.CustomRequestHeaders,
-        WebViewCapability.JavaScriptEvaluation,
-    ),
-)
-```
+## Platform support
 
-This prevents the library from selecting an implementation that cannot provide those features.
+| Platform | Backend |
+| --- | --- |
+| Android | Android WebView |
+| iOS | WKWebView |
+| macOS | WKWebView |
+| Windows | Microsoft Edge WebView2 |
+| Linux | WPE WebKit by default; Chromium/Firefox are optional |
+| JavaScript | iframe |
 
-## Choosing a browser on Linux
+### Linux
 
-By default, Linux uses the system WebView backend: WPE WebKit.
+`WebViewBackendId.System` means WPE WebKit on Linux.
 
-You can also choose an installed Chromium-based or Firefox-based browser explicitly.
-
-To prefer Firefox:
-
-```kotlin
-val controller = rememberWebViewController(
-    order = listOf(
-        WebViewBackendId.Firefox,
-        WebViewBackendId.Chromium,
-    ),
-)
-```
-
-To prefer Chromium:
+To prefer an installed browser:
 
 ```kotlin
 val controller = rememberWebViewController(
@@ -192,107 +292,67 @@ val controller = rememberWebViewController(
 )
 ```
 
-`WebViewBackendId.System` always means WPE WebKit on Linux. It does not fall back to Chrome or
-Firefox.
+Common Chromium- and Firefox-based installations are detected automatically.
 
-Common Chrome, Chromium, Edge, Brave, Vivaldi, Firefox, LibreWolf, Floorp, Waterfox, and Zen
-installations are detected automatically.
-
-For an unusual browser location, set one of these environment variables before starting the app:
+For unusual locations:
 
 ```shell
 WEBVIEW_KMP_CHROMIUM_EXECUTABLE=/path/to/chromium
 WEBVIEW_KMP_FIREFOX_EXECUTABLE=/path/to/firefox
 ```
 
-## Windows setup
+Chromium/Firefox backends use webview-kmp-owned profiles and do not reuse or modify the user's normal browser profile.
 
-Windows uses the installed Microsoft Edge WebView2 Runtime.
+### Windows
 
-The browser runtime itself is **not** bundled with this library. Most current Windows installations
-already have it.
+Windows uses the installed Edge WebView2 Runtime.
 
-Your application also needs Microsoft's small `WebView2Loader.dll` next to the final `.exe`.
+Your final app also needs `WebView2Loader.dll` next to the executable. The Windows Maven artifact publishes the loader with the `webview2-loader` classifier.
 
-The Windows Maven artifact publishes that DLL and Microsoft's license alongside the Kotlin/Native
-library. They use the classifiers `webview2-loader` and `webview2-license`, so packaging tools can
-resolve the loader directly from Maven instead of cloning this repository.
-
-If you are building this repository itself, the convenience task below copies both files into one
-directory:
+When building this repository, this helper copies the loader and license into one directory:
 
 ```shell
 ./gradlew copyWindowsWebView2Loader
 ```
 
-The files are written to:
+### Apple
 
-```text
-webview-windows/build/windows-runtime/
-├── WebView2Loader.dll
-└── WebView2-LICENSE.txt
-```
-
-Copy `WebView2Loader.dll` next to your application executable when packaging your Windows app.
-
-## Platform notes
-
-### Android
-
-Uses the WebView provider installed on the device. No browser engine is packaged by this library.
-
-### iOS and macOS
-
-Use Apple's system WKWebView. No WebKit binary is packaged by this library.
-
-macOS requires a Compose Native release that includes native AppKit view interop.
-
-### Linux
-
-The default `System` backend uses WPE WebKit. WPE WebKit must be installed on the build and target
-system.
-
-Chromium and Firefox are optional alternative backends. When one of those is selected, the browser
-runs with an isolated temporary profile, so it does not reuse or modify the user's normal browser
-profile.
+iOS and macOS use the system WKWebView. Named persistent profiles require iOS 17+ or macOS 14+. Ephemeral profiles use WebKit's non-persistent data store.
 
 ### JavaScript
 
-Uses an iframe, so normal browser security rules apply. In particular, scripts cannot access the
-contents of unrelated cross-origin pages.
+The JS target uses an iframe, so normal browser same-origin restrictions apply. Cross-origin page contents, native cookies, and arbitrary cross-origin script injection are not available.
 
-### Windows
+## Feature overview
 
-Requires the Microsoft Edge WebView2 Runtime to be installed.
+The common API includes:
 
-Rendering is currently optimized for normal application pages rather than high-frame-rate video or
-animation.
-
-## Available features
-
-The common API currently includes:
-
-- loading URLs;
-- loading HTML;
-- reload and stop;
-- back and forward navigation;
+- URL and HTML loading;
+- reload, stop, back, and forward;
+- state and progress;
 - JavaScript evaluation;
-- URL and page title state;
-- loading state and progress;
+- navigation await helpers and events;
 - custom user agents;
-- optional JavaScript disabling;
 - custom request headers where supported;
-- selecting a preferred browser implementation.
+- cookies where supported;
+- default, ephemeral, and named persistent profiles where supported;
+- navigation interception where supported;
+- document user scripts where supported;
+- app/page messaging where supported;
+- Linux backend selection.
 
-Features such as downloads, file pickers, permissions, cookies/profiles, web messaging, request
-interception, and new-window handling are not part of the public API yet.
+Not yet exposed as public cross-platform APIs:
 
-## Advanced: use only the core API
+- downloads;
+- file pickers;
+- permission requests;
+- new-window / popup handling.
 
-Most applications should depend on `webview-compose` and stop there.
+## Advanced: core API only
 
-If you are building your own integration and do not want the Compose WebView UI, you can instead use
-`webview-core` together with a specific platform implementation:
+Most apps should use `webview-compose`.
+
+If you are building your own UI integration, use `webview-core` plus the platform modules you need:
 
 ```text
 webview-core
@@ -304,14 +364,6 @@ webview-macos
 webview-windows
 ```
 
-This is an advanced use case. Normal multiplatform applications do not need to declare these
-modules individually.
+## Status
 
-## Current status
-
-Linux has been runtime-tested with Chrome and Firefox. The WPE WebKit renderer is based on the
-runtime-tested Compose Native WPE integration and is compile/link-tested in this library.
-
-Android, JavaScript, Windows, iOS, and macOS implementations compile successfully. Windows, iOS,
-and macOS still need broader real-device/runtime testing before the library should be considered
-stable.
+Linux Chromium and Firefox have runtime integration tests. WPE WebKit is compile/link tested in this library. Android, JavaScript, Windows, iOS, and macOS compile successfully; broader real-device coverage is still ongoing on some platforms.

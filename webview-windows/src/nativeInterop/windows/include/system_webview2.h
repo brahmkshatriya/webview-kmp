@@ -9,6 +9,17 @@ typedef struct KtnWebView2 KtnWebView2;
 
 typedef void (*KtnWebView2StateCallback)(void *user_data);
 typedef void (*KtnWebView2JavaScriptCallback)(void *user_data, int success, const char *value);
+typedef void (*KtnWebView2CookieCallback)(void *user_data, int success, const char *value);
+typedef int (*KtnWebView2NavigationCallback)(
+    void *user_data,
+    const char *url,
+    int is_redirect,
+    int is_user_initiated
+);
+typedef void (*KtnWebView2MessageCallback)(
+    void *user_data,
+    const char *data
+);
 
 int ktn_webview2_runtime_available(void);
 const char *ktn_webview2_runtime_status(void);
@@ -16,6 +27,8 @@ const char *ktn_webview2_runtime_status(void);
 KtnWebView2 *ktn_webview2_create(
     int javascript_enabled,
     const char *user_agent,
+    int profile_mode,
+    const char *profile_name,
     KtnWebView2StateCallback state_callback,
     void *user_data
 );
@@ -80,6 +93,57 @@ void ktn_webview2_evaluate_javascript(
     KtnWebView2 *view,
     const char *script,
     KtnWebView2JavaScriptCallback callback,
+    void *user_data
+);
+void ktn_webview2_set_navigation_callback(
+    KtnWebView2 *view,
+    KtnWebView2NavigationCallback callback,
+    void *user_data
+);
+void ktn_webview2_add_user_script(
+    KtnWebView2 *view,
+    const char *script
+);
+void ktn_webview2_set_message_callback(
+    KtnWebView2 *view,
+    KtnWebView2MessageCallback callback,
+    void *user_data
+);
+void ktn_webview2_post_message(
+    KtnWebView2 *view,
+    const char *data
+);
+void ktn_webview2_get_cookies(
+    KtnWebView2 *view,
+    const char *url,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+);
+void ktn_webview2_set_cookie(
+    KtnWebView2 *view,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    long long expires_at_millis,
+    int secure,
+    int http_only,
+    int same_site,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+);
+void ktn_webview2_delete_cookie(
+    KtnWebView2 *view,
+    const char *url,
+    const char *name,
+    const char *domain,
+    const char *path,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+);
+void ktn_webview2_clear_cookies(
+    KtnWebView2 *view,
+    KtnWebView2CookieCallback callback,
     void *user_data
 );
 

@@ -14,6 +14,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
@@ -67,7 +68,17 @@ internal interface BrowserPageSession {
 
     suspend fun evaluateJavaScript(script: String): JavaScriptResult
 
+    suspend fun installUserScripts(scripts: List<WebViewUserScript>)
+
     suspend fun snapshot(): BrowserPageSnapshot
+
+    suspend fun getCookies(url: String): List<WebViewCookie>
+
+    suspend fun setCookie(url: String, cookie: WebViewCookie)
+
+    suspend fun deleteCookie(url: String, cookie: WebViewCookie)
+
+    suspend fun clearCookies()
 
     fun close()
 }
@@ -271,6 +282,15 @@ private class ChromiumPageSession(
         return JavaScriptResult.Value(remote["value"]?.toString())
     }
 
+    override suspend fun installUserScripts(scripts: List<WebViewUserScript>) {
+        scripts.forEach { script ->
+            rpc.call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                buildJsonObject { put("source", browserUserScriptSource(script)) },
+            )
+        }
+    }
+
     override suspend fun snapshot(): BrowserPageSnapshot {
         val payload =
             evaluateString(
@@ -289,6 +309,56 @@ private class ChromiumPageSession(
             canGoBack = index > 0,
             canGoForward = index >= 0 && index < entries.lastIndex,
         )
+    }
+
+    override suspend fun getCookies(url: String): List<WebViewCookie> {
+        rpc.call("Network.enable")
+        val cookies = rpc.call(
+            "Network.getCookies",
+            buildJsonObject { put("urls", JsonArray(listOf(JsonPrimitive(url)))) },
+        )["result"]?.jsonObject?.get("cookies")?.jsonArray.orEmpty()
+        return cookies.mapNotNull { element ->
+            runCatching { element.jsonObject.toChromiumCookie() }.getOrNull()
+        }
+    }
+
+    override suspend fun setCookie(url: String, cookie: WebViewCookie) {
+        rpc.call("Network.enable")
+        val result = rpc.call(
+            "Network.setCookie",
+            buildJsonObject {
+                put("name", cookie.name)
+                put("value", cookie.value)
+                put("url", url)
+                cookie.domain?.let { put("domain", it) }
+                cookie.path?.let { put("path", it) }
+                cookie.secure?.let { put("secure", it) }
+                cookie.httpOnly?.let { put("httpOnly", it) }
+                cookie.sameSite?.let { put("sameSite", it.toChromiumSameSite()) }
+                cookie.expiresAtMillis?.let { put("expires", it / 1000.0) }
+            },
+        )["result"]?.jsonObject
+        check(result?.get("success")?.jsonPrimitive?.booleanOrNull != false) {
+            "Chromium rejected the cookie"
+        }
+    }
+
+    override suspend fun deleteCookie(url: String, cookie: WebViewCookie) {
+        rpc.call("Network.enable")
+        rpc.call(
+            "Network.deleteCookies",
+            buildJsonObject {
+                put("name", cookie.name)
+                put("url", url)
+                cookie.domain?.let { put("domain", it) }
+                cookie.path?.let { put("path", it) }
+            },
+        )
+    }
+
+    override suspend fun clearCookies() {
+        rpc.call("Network.enable")
+        rpc.call("Network.clearBrowserCookies")
     }
 
     override fun close(): Unit = rpc.close()
@@ -478,6 +548,18 @@ private class FirefoxPageSession(
         return JavaScriptResult.Value(value["value"]?.jsonPrimitive?.contentOrNull)
     }
 
+    override suspend fun installUserScripts(scripts: List<WebViewUserScript>) {
+        scripts.forEach { script ->
+            rpc.call(
+                "script.addPreloadScript",
+                buildJsonObject {
+                    put("functionDeclaration", "() => { ${browserUserScriptSource(script)} }")
+                    put("contexts", JsonArray(listOf(JsonPrimitive(context))))
+                },
+            )
+        }
+    }
+
     override suspend fun snapshot(): BrowserPageSnapshot {
         val result =
             evaluateExpression(
@@ -502,6 +584,62 @@ private class FirefoxPageSession(
         )
     }
 
+    override suspend fun getCookies(url: String): List<WebViewCookie> {
+        val cookies =
+            rpc.call("storage.getCookies")["result"]
+                ?.jsonObject
+                ?.get("cookies")
+                ?.jsonArray
+                .orEmpty()
+                .mapNotNull { element ->
+                    runCatching { element.jsonObject.toFirefoxCookie() }.getOrNull()
+                }
+        return cookies.filter { it.matchesUrl(url) }
+    }
+
+    override suspend fun setCookie(url: String, cookie: WebViewCookie) {
+        val parsed = ParsedCookieUrl(url)
+        rpc.call(
+            "storage.setCookie",
+            buildJsonObject {
+                put(
+                    "cookie",
+                    buildJsonObject {
+                        put("name", cookie.name)
+                        put("value", bidiBytes(cookie.value))
+                        put("domain", cookie.domain ?: parsed.host)
+                        put("path", cookie.path ?: "/")
+                        cookie.secure?.let { put("secure", it) }
+                        cookie.httpOnly?.let { put("httpOnly", it) }
+                        cookie.sameSite?.let { put("sameSite", it.name.lowercase()) }
+                        cookie.expiresAtMillis?.let { put("expiry", it / 1000.0) }
+                    },
+                )
+            },
+        )
+    }
+
+    override suspend fun deleteCookie(url: String, cookie: WebViewCookie) {
+        val parsed = ParsedCookieUrl(url)
+        rpc.call(
+            "storage.deleteCookies",
+            buildJsonObject {
+                put(
+                    "filter",
+                    buildJsonObject {
+                        put("name", cookie.name)
+                        put("domain", cookie.domain ?: parsed.host)
+                        put("path", cookie.path ?: "/")
+                    },
+                )
+            },
+        )
+    }
+
+    override suspend fun clearCookies() {
+        rpc.call("storage.deleteCookies", buildJsonObject {})
+    }
+
     override fun close(): Unit = rpc.close()
 
     private suspend fun evaluateExpression(expression: String): JsonObject =
@@ -513,6 +651,101 @@ private class FirefoxPageSession(
                 put("awaitPromise", true)
             },
         )["result"]?.jsonObject ?: error("Missing Firefox BiDi result")
+}
+
+private fun JsonObject.toChromiumCookie(): WebViewCookie =
+    WebViewCookie(
+        name = getValue("name").jsonPrimitive.content,
+        value = getValue("value").jsonPrimitive.content,
+        domain = get("domain")?.jsonPrimitive?.contentOrNull,
+        path = get("path")?.jsonPrimitive?.contentOrNull,
+        expiresAtMillis =
+            get("expires")?.jsonPrimitive?.doubleOrNull
+                ?.takeIf { it > 0 }
+                ?.times(1000.0)
+                ?.toLong(),
+        secure = get("secure")?.jsonPrimitive?.booleanOrNull,
+        httpOnly = get("httpOnly")?.jsonPrimitive?.booleanOrNull,
+        sameSite = get("sameSite")?.jsonPrimitive?.contentOrNull.toCookieSameSite(),
+    )
+
+private fun JsonObject.toFirefoxCookie(): WebViewCookie =
+    WebViewCookie(
+        name = getValue("name").jsonPrimitive.content,
+        value = get("value")?.jsonObject?.get("value")?.jsonPrimitive?.contentOrNull.orEmpty(),
+        domain = get("domain")?.jsonPrimitive?.contentOrNull,
+        path = get("path")?.jsonPrimitive?.contentOrNull,
+        expiresAtMillis = get("expiry")?.jsonPrimitive?.doubleOrNull?.times(1000.0)?.toLong(),
+        secure = get("secure")?.jsonPrimitive?.booleanOrNull,
+        httpOnly = get("httpOnly")?.jsonPrimitive?.booleanOrNull,
+        sameSite = get("sameSite")?.jsonPrimitive?.contentOrNull.toCookieSameSite(),
+    )
+
+private fun String?.toCookieSameSite(): WebViewCookieSameSite? =
+    when (this?.lowercase()) {
+        "strict" -> WebViewCookieSameSite.Strict
+        "lax" -> WebViewCookieSameSite.Lax
+        "none" -> WebViewCookieSameSite.None
+        else -> null
+    }
+
+private fun WebViewCookieSameSite.toChromiumSameSite(): String =
+    when (this) {
+        WebViewCookieSameSite.Strict -> "Strict"
+        WebViewCookieSameSite.Lax -> "Lax"
+        WebViewCookieSameSite.None -> "None"
+    }
+
+private fun browserUserScriptSource(script: WebViewUserScript): String {
+    val source =
+        if (script.mainFrameOnly) {
+            "if (window.top === window) { ${script.source}\n }"
+        } else {
+            script.source
+        }
+    return when (script.injectionTime) {
+        WebViewUserScriptInjectionTime.DocumentStart -> source
+        WebViewUserScriptInjectionTime.DocumentEnd ->
+            """
+            (() => {
+                const __webviewKmpRun = () => { $source };
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', __webviewKmpRun, { once: true });
+                } else {
+                    __webviewKmpRun();
+                }
+            })();
+            """.trimIndent()
+    }
+}
+
+private fun bidiBytes(value: String): JsonObject =
+    buildJsonObject {
+        put("type", "string")
+        put("value", value)
+    }
+
+private data class ParsedCookieUrl(private val url: String) {
+    private val afterScheme: String = url.substringAfter("://", url)
+    val secure: Boolean = url.startsWith("https://", ignoreCase = true)
+    val host: String = afterScheme.substringBefore('/').substringBefore(':').lowercase()
+    val path: String =
+        afterScheme.substringAfter('/', "").let { suffix ->
+            if (suffix.isEmpty()) "/" else "/$suffix"
+        }
+}
+
+private fun WebViewCookie.matchesUrl(url: String): Boolean {
+    val parsed = ParsedCookieUrl(url)
+    if (secure == true && !parsed.secure) return false
+    val cookieDomain = domain?.trimStart('.')?.lowercase()
+    if (
+        cookieDomain != null &&
+        parsed.host != cookieDomain &&
+        !parsed.host.endsWith(".$cookieDomain")
+    ) return false
+    val cookiePath = path?.takeIf(String::isNotEmpty) ?: "/"
+    return parsed.path.startsWith(cookiePath)
 }
 
 private fun chromiumExceptionMessage(details: JsonObject): String =

@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <objbase.h>
+#include <shellapi.h>
 #include <wincodec.h>
 #include <WebView2.h>
 
@@ -87,6 +88,9 @@ KTN_HANDLER_IID(ICoreWebView2HistoryChangedEventHandler)
 KTN_HANDLER_IID(ICoreWebView2DocumentTitleChangedEventHandler)
 KTN_HANDLER_IID(ICoreWebView2ExecuteScriptCompletedHandler)
 KTN_HANDLER_IID(ICoreWebView2CapturePreviewCompletedHandler)
+KTN_HANDLER_IID(ICoreWebView2GetCookiesCompletedHandler)
+KTN_HANDLER_IID(ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler)
+KTN_HANDLER_IID(ICoreWebView2WebMessageReceivedEventHandler)
 
 #undef KTN_HANDLER_IID
 
@@ -127,6 +131,10 @@ struct State : std::enable_shared_from_this<State> {
     ICoreWebView2 *webview = nullptr;
     KtnWebView2StateCallback state_callback = nullptr;
     void *user_data = nullptr;
+    KtnWebView2NavigationCallback navigation_callback = nullptr;
+    void *navigation_user_data = nullptr;
+    KtnWebView2MessageCallback message_callback = nullptr;
+    void *message_user_data = nullptr;
     bool closed = false;
     bool ready = false;
     bool loading = false;
@@ -145,6 +153,8 @@ struct State : std::enable_shared_from_this<State> {
     bool can_go_back = false;
     bool can_go_forward = false;
     std::wstring user_agent;
+    std::wstring user_data_folder;
+    bool delete_user_data_on_close = false;
     std::string url;
     std::string title;
     std::string error;
@@ -154,11 +164,13 @@ struct State : std::enable_shared_from_this<State> {
     EventRegistrationToken source_changed{};
     EventRegistrationToken history_changed{};
     EventRegistrationToken title_changed{};
+    EventRegistrationToken web_message_received{};
     bool has_navigation_starting = false;
     bool has_navigation_completed = false;
     bool has_source_changed = false;
     bool has_history_changed = false;
     bool has_title_changed = false;
+    bool has_web_message_received = false;
 
     ~State() {
         close();
@@ -220,11 +232,13 @@ struct State : std::enable_shared_from_this<State> {
         if (has_source_changed) webview->remove_SourceChanged(source_changed);
         if (has_history_changed) webview->remove_HistoryChanged(history_changed);
         if (has_title_changed) webview->remove_DocumentTitleChanged(title_changed);
+        if (has_web_message_received) webview->remove_WebMessageReceived(web_message_received);
         has_navigation_starting = false;
         has_navigation_completed = false;
         has_source_changed = false;
         has_history_changed = false;
         has_title_changed = false;
+        has_web_message_received = false;
     }
 
     void close() {
@@ -237,6 +251,35 @@ struct State : std::enable_shared_from_this<State> {
         release_com(webview);
         release_com(controller);
         release_com(environment);
+        if (delete_user_data_on_close && !user_data_folder.empty()) {
+            WIN32_FIND_DATAW find_data{};
+            const std::wstring pattern = user_data_folder + L"\\*";
+            HANDLE find = FindFirstFileW(pattern.c_str(), &find_data);
+            if (find != INVALID_HANDLE_VALUE) {
+                do {
+                    const wchar_t *name = find_data.cFileName;
+                    if (!std::wcscmp(name, L".") || !std::wcscmp(name, L"..")) continue;
+                    const std::wstring child = user_data_folder + L"\\" + name;
+                    if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                        // WebView2 profile contents can be nested deeply. Defer recursive cleanup
+                        // to the shell so read-only attributes and nested directories are handled.
+                        SHFILEOPSTRUCTW operation{};
+                        std::wstring source = child;
+                        source.push_back(L'\0');
+                        source.push_back(L'\0');
+                        operation.wFunc = FO_DELETE;
+                        operation.pFrom = source.c_str();
+                        operation.fFlags = FOF_NO_UI;
+                        SHFileOperationW(&operation);
+                    } else {
+                        SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+                        DeleteFileW(child.c_str());
+                    }
+                } while (FindNextFileW(find, &find_data));
+                FindClose(find);
+            }
+            RemoveDirectoryW(user_data_folder.c_str());
+        }
         if (host) {
             DestroyWindow(host);
             host = nullptr;
@@ -286,6 +329,123 @@ public:
 
 private:
     KtnWebView2JavaScriptCallback callback_;
+    void *user_data_;
+};
+
+class AddScriptHandler final
+    : public ComHandlerBase<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT, LPCWSTR) override { return S_OK; }
+};
+
+std::string json_string(const std::string &value) {
+    std::string output = "\"";
+    for (const unsigned char ch : value) {
+        switch (ch) {
+            case '\\': output += "\\\\"; break;
+            case '"': output += "\\\""; break;
+            case '\b': output += "\\b"; break;
+            case '\f': output += "\\f"; break;
+            case '\n': output += "\\n"; break;
+            case '\r': output += "\\r"; break;
+            case '\t': output += "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    char escaped[7]{};
+                    std::snprintf(escaped, sizeof(escaped), "\\u%04x", ch);
+                    output += escaped;
+                } else {
+                    output.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    output += '"';
+    return output;
+}
+
+class GetCookiesHandler final : public ComHandlerBase<ICoreWebView2GetCookiesCompletedHandler> {
+public:
+    GetCookiesHandler(KtnWebView2CookieCallback callback, void *user_data)
+        : callback_(callback), user_data_(user_data) {}
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT error_code, ICoreWebView2CookieList *result) override {
+        if (!callback_) return S_OK;
+        if (FAILED(error_code) || !result) {
+            const std::string error = hresult_text("GetCookies", error_code);
+            callback_(user_data_, 0, error.c_str());
+            finish();
+            return S_OK;
+        }
+
+        UINT count = 0;
+        const HRESULT count_result = result->get_Count(&count);
+        if (FAILED(count_result)) {
+            const std::string error = hresult_text("CookieList.get_Count", count_result);
+            callback_(user_data_, 0, error.c_str());
+            finish();
+            return S_OK;
+        }
+
+        std::string json = "[";
+        bool first = true;
+        for (UINT index = 0; index < count; ++index) {
+            ICoreWebView2Cookie *cookie = nullptr;
+            if (FAILED(result->GetValueAtIndex(index, &cookie)) || !cookie) continue;
+
+            LPWSTR name = nullptr;
+            LPWSTR value = nullptr;
+            LPWSTR domain = nullptr;
+            LPWSTR path = nullptr;
+            double expires = 0.0;
+            BOOL is_http_only = FALSE;
+            BOOL is_secure = FALSE;
+            BOOL is_session = FALSE;
+            COREWEBVIEW2_COOKIE_SAME_SITE_KIND same_site = COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE;
+
+            cookie->get_Name(&name);
+            cookie->get_Value(&value);
+            cookie->get_Domain(&domain);
+            cookie->get_Path(&path);
+            cookie->get_Expires(&expires);
+            cookie->get_IsHttpOnly(&is_http_only);
+            cookie->get_IsSecure(&is_secure);
+            cookie->get_IsSession(&is_session);
+            cookie->get_SameSite(&same_site);
+
+            if (!first) json += ',';
+            first = false;
+            json += "{\"name\":" + json_string(wide_to_utf8(name));
+            json += ",\"value\":" + json_string(wide_to_utf8(value));
+            json += ",\"domain\":" + json_string(wide_to_utf8(domain));
+            json += ",\"path\":" + json_string(wide_to_utf8(path));
+            const long long expires_millis = is_session
+                ? -1LL
+                : static_cast<long long>(expires * 1000.0);
+            json += ",\"expiresAtMillis\":" + std::to_string(expires_millis);
+            json += ",\"secure\":" + std::string(is_secure ? "true" : "false");
+            json += ",\"httpOnly\":" + std::string(is_http_only ? "true" : "false");
+            json += ",\"sameSite\":" + std::to_string(static_cast<int>(same_site));
+            json += '}';
+
+            if (name) CoTaskMemFree(name);
+            if (value) CoTaskMemFree(value);
+            if (domain) CoTaskMemFree(domain);
+            if (path) CoTaskMemFree(path);
+            cookie->Release();
+        }
+        json += ']';
+        callback_(user_data_, 1, json.c_str());
+        finish();
+        return S_OK;
+    }
+
+private:
+    void finish() {
+        callback_ = nullptr;
+        user_data_ = nullptr;
+    }
+
+    KtnWebView2CookieCallback callback_;
     void *user_data_;
 };
 
@@ -520,7 +680,40 @@ public:
             >;
             auto *handler = new Handler(
                 weak,
-                [](State &value, ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *) {
+                [](State &value, ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) {
+                    if (args && value.navigation_callback) {
+                        LPWSTR uri = nullptr;
+                        BOOL redirected = FALSE;
+                        BOOL user_initiated = FALSE;
+                        args->get_Uri(&uri);
+                        args->get_IsRedirected(&redirected);
+                        args->get_IsUserInitiated(&user_initiated);
+                        const std::string utf8_uri = wide_to_utf8(uri);
+                        if (uri) CoTaskMemFree(uri);
+                        const int decision = value.navigation_callback(
+                            value.navigation_user_data,
+                            utf8_uri.c_str(),
+                            redirected != FALSE,
+                            user_initiated != FALSE
+                        );
+                        if (decision != 0) {
+                            args->put_Cancel(TRUE);
+                            if (decision == 2) {
+                                const std::wstring external_uri = utf8_to_wide(utf8_uri.c_str());
+                                if (!external_uri.empty()) {
+                                    ShellExecuteW(
+                                        nullptr,
+                                        L"open",
+                                        external_uri.c_str(),
+                                        nullptr,
+                                        nullptr,
+                                        SW_SHOWNORMAL
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                    }
                     value.loading = true;
                     value.progress = 0.0f;
                     value.error.clear();
@@ -603,6 +796,27 @@ public:
             }
             handler->Release();
         }
+        {
+            using Handler = StateEventHandler<
+                ICoreWebView2WebMessageReceivedEventHandler,
+                ICoreWebView2WebMessageReceivedEventArgs
+            >;
+            auto *handler = new Handler(
+                weak,
+                [](State &value, ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) {
+                    if (!args || !value.message_callback) return;
+                    LPWSTR message = nullptr;
+                    if (FAILED(args->TryGetWebMessageAsString(&message)) || !message) return;
+                    const std::string utf8 = wide_to_utf8(message);
+                    CoTaskMemFree(message);
+                    value.message_callback(value.message_user_data, utf8.c_str());
+                }
+            );
+            if (SUCCEEDED(state->webview->add_WebMessageReceived(handler, &state->web_message_received))) {
+                state->has_web_message_received = true;
+            }
+            handler->Release();
+        }
 
         state->apply_bounds();
         state->ready = true;
@@ -659,6 +873,52 @@ std::wstring user_data_folder() {
     return folder;
 }
 
+std::wstring profile_user_data_folder(
+    int profile_mode,
+    const char *profile_name,
+    bool *delete_on_close
+) {
+    if (delete_on_close) *delete_on_close = false;
+    if (profile_mode == 0) return user_data_folder();
+
+    wchar_t base[MAX_PATH]{};
+    if (profile_mode == 1) {
+        const DWORD size = GetTempPathW(MAX_PATH, base);
+        std::wstring parent = size > 0 && size < MAX_PATH ? std::wstring(base) : L".";
+        if (!parent.empty() && parent.back() != L'\\') parent += L'\\';
+        parent += L"WebViewKmp";
+        CreateDirectoryW(parent.c_str(), nullptr);
+        static std::atomic<unsigned long> serial{0};
+        const std::wstring folder =
+            parent + L"\\Ephemeral-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(++serial);
+        CreateDirectoryW(folder.c_str(), nullptr);
+        if (delete_on_close) *delete_on_close = true;
+        return folder;
+    }
+
+    const DWORD size = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    std::wstring parent = size > 0 && size < MAX_PATH ? std::wstring(base) : L".";
+    parent += L"\\WebViewKmp";
+    CreateDirectoryW(parent.c_str(), nullptr);
+    parent += L"\\Profiles";
+    CreateDirectoryW(parent.c_str(), nullptr);
+
+    std::wstring name = utf8_to_wide(profile_name);
+    if (name.empty()) name = L"default";
+    for (wchar_t &character : name) {
+        const bool valid =
+            (character >= L'a' && character <= L'z') ||
+            (character >= L'A' && character <= L'Z') ||
+            (character >= L'0' && character <= L'9') ||
+            character == L'.' || character == L'_' || character == L'-';
+        if (!valid) character = L'_';
+    }
+    const std::wstring folder = parent + L"\\" + name;
+    CreateDirectoryW(folder.c_str(), nullptr);
+    return folder;
+}
+
 } // namespace
 
 struct KtnWebView2 {
@@ -669,6 +929,22 @@ namespace {
 
 std::shared_ptr<State> state_of(KtnWebView2 *view) {
     return view ? view->state : nullptr;
+}
+
+HRESULT cookie_manager_of(
+    const std::shared_ptr<State> &state,
+    ICoreWebView2CookieManager **manager
+) {
+    if (!manager) return E_POINTER;
+    *manager = nullptr;
+    if (!state || !state->webview || state->closed) return E_FAIL;
+    ICoreWebView2_2 *webview2 = nullptr;
+    HRESULT result = state->webview->QueryInterface(IID_PPV_ARGS(&webview2));
+    if (SUCCEEDED(result) && webview2) {
+        result = webview2->get_CookieManager(manager);
+        webview2->Release();
+    }
+    return result;
 }
 
 } // namespace
@@ -710,6 +986,8 @@ extern "C" const char *ktn_webview2_runtime_status(void) {
 extern "C" KtnWebView2 *ktn_webview2_create(
     int javascript_enabled,
     const char *user_agent,
+    int profile_mode,
+    const char *profile_name,
     KtnWebView2StateCallback state_callback,
     void *user_data
 ) {
@@ -718,6 +996,11 @@ extern "C" KtnWebView2 *ktn_webview2_create(
     result->state = state;
     state->javascript_enabled = javascript_enabled != 0;
     state->user_agent = utf8_to_wide(user_agent);
+    state->user_data_folder = profile_user_data_folder(
+        profile_mode,
+        profile_name,
+        &state->delete_user_data_on_close
+    );
     state->state_callback = state_callback;
     state->user_data = user_data;
 
@@ -769,10 +1052,9 @@ extern "C" KtnWebView2 *ktn_webview2_create(
     }
 
     auto *handler = new EnvironmentCompletedHandler(state);
-    const std::wstring data_folder = user_data_folder();
     const HRESULT create_result = create_environment(
         nullptr,
-        data_folder.c_str(),
+        state->user_data_folder.c_str(),
         nullptr,
         handler
     );
@@ -1044,4 +1326,193 @@ extern "C" void ktn_webview2_evaluate_javascript(
         callback(user_data, 0, error.c_str());
     }
     handler->Release();
+}
+
+extern "C" void ktn_webview2_set_navigation_callback(
+    KtnWebView2 *view,
+    KtnWebView2NavigationCallback callback,
+    void *user_data
+) {
+    const auto state = state_of(view);
+    if (!state) return;
+    state->navigation_callback = callback;
+    state->navigation_user_data = user_data;
+}
+
+extern "C" void ktn_webview2_add_user_script(
+    KtnWebView2 *view,
+    const char *script
+) {
+    const auto state = state_of(view);
+    if (!state || !state->webview || state->closed || !script || !*script) return;
+    const std::wstring wide = utf8_to_wide(script);
+    auto *handler = new AddScriptHandler();
+    state->webview->AddScriptToExecuteOnDocumentCreated(wide.c_str(), handler);
+    handler->Release();
+}
+
+extern "C" void ktn_webview2_set_message_callback(
+    KtnWebView2 *view,
+    KtnWebView2MessageCallback callback,
+    void *user_data
+) {
+    const auto state = state_of(view);
+    if (!state) return;
+    state->message_callback = callback;
+    state->message_user_data = user_data;
+}
+
+extern "C" void ktn_webview2_post_message(
+    KtnWebView2 *view,
+    const char *data
+) {
+    const auto state = state_of(view);
+    if (!state || !state->webview || state->closed || !data) return;
+    const std::wstring wide = utf8_to_wide(data);
+    state->webview->PostWebMessageAsString(wide.c_str());
+}
+
+extern "C" void ktn_webview2_get_cookies(
+    KtnWebView2 *view,
+    const char *url,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    const auto state = state_of(view);
+    ICoreWebView2CookieManager *manager = nullptr;
+    const HRESULT manager_result = cookie_manager_of(state, &manager);
+    if (FAILED(manager_result) || !manager) {
+        const std::string error = hresult_text("WebView2 CookieManager", manager_result);
+        callback(user_data, 0, error.c_str());
+        return;
+    }
+    const std::wstring wide_url = utf8_to_wide(url);
+    auto *handler = new GetCookiesHandler(callback, user_data);
+    const HRESULT result = manager->GetCookies(wide_url.c_str(), handler);
+    if (FAILED(result)) {
+        const std::string error = hresult_text("GetCookies", result);
+        callback(user_data, 0, error.c_str());
+    }
+    handler->Release();
+    manager->Release();
+}
+
+extern "C" void ktn_webview2_set_cookie(
+    KtnWebView2 *view,
+    const char *name,
+    const char *value,
+    const char *domain,
+    const char *path,
+    long long expires_at_millis,
+    int secure,
+    int http_only,
+    int same_site,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    const auto state = state_of(view);
+    ICoreWebView2CookieManager *manager = nullptr;
+    HRESULT result = cookie_manager_of(state, &manager);
+    if (FAILED(result) || !manager) {
+        const std::string error = hresult_text("WebView2 CookieManager", result);
+        callback(user_data, 0, error.c_str());
+        return;
+    }
+
+    const std::wstring wide_name = utf8_to_wide(name);
+    const std::wstring wide_value = utf8_to_wide(value);
+    const std::wstring wide_domain = utf8_to_wide(domain);
+    const std::wstring wide_path = utf8_to_wide(path);
+    ICoreWebView2Cookie *cookie = nullptr;
+    result = manager->CreateCookie(
+        wide_name.c_str(),
+        wide_value.c_str(),
+        wide_domain.c_str(),
+        wide_path.empty() ? L"/" : wide_path.c_str(),
+        &cookie
+    );
+    if (SUCCEEDED(result) && cookie) {
+        if (expires_at_millis >= 0) {
+            result = cookie->put_Expires(static_cast<double>(expires_at_millis) / 1000.0);
+        }
+        if (SUCCEEDED(result) && secure >= 0) {
+            result = cookie->put_IsSecure(secure ? TRUE : FALSE);
+        }
+        if (SUCCEEDED(result) && http_only >= 0) {
+            result = cookie->put_IsHttpOnly(http_only ? TRUE : FALSE);
+        }
+        if (SUCCEEDED(result) && same_site >= 0 && same_site <= 2) {
+            result = cookie->put_SameSite(
+                static_cast<COREWEBVIEW2_COOKIE_SAME_SITE_KIND>(same_site)
+            );
+        }
+        if (SUCCEEDED(result)) result = manager->AddOrUpdateCookie(cookie);
+    }
+    if (cookie) cookie->Release();
+    manager->Release();
+    if (FAILED(result)) {
+        const std::string error = hresult_text("SetCookie", result);
+        callback(user_data, 0, error.c_str());
+    } else {
+        callback(user_data, 1, nullptr);
+    }
+}
+
+extern "C" void ktn_webview2_delete_cookie(
+    KtnWebView2 *view,
+    const char *url,
+    const char *name,
+    const char *domain,
+    const char *path,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    const auto state = state_of(view);
+    ICoreWebView2CookieManager *manager = nullptr;
+    HRESULT result = cookie_manager_of(state, &manager);
+    if (FAILED(result) || !manager) {
+        const std::string error = hresult_text("WebView2 CookieManager", result);
+        callback(user_data, 0, error.c_str());
+        return;
+    }
+    const std::wstring wide_name = utf8_to_wide(name);
+    if (domain && *domain && path && *path) {
+        const std::wstring wide_domain = utf8_to_wide(domain);
+        const std::wstring wide_path = utf8_to_wide(path);
+        result = manager->DeleteCookiesWithDomainAndPath(
+            wide_name.c_str(), wide_domain.c_str(), wide_path.c_str()
+        );
+    } else {
+        const std::wstring wide_url = utf8_to_wide(url);
+        result = manager->DeleteCookies(wide_name.c_str(), wide_url.c_str());
+    }
+    manager->Release();
+    if (FAILED(result)) {
+        const std::string error = hresult_text("DeleteCookie", result);
+        callback(user_data, 0, error.c_str());
+    } else {
+        callback(user_data, 1, nullptr);
+    }
+}
+
+extern "C" void ktn_webview2_clear_cookies(
+    KtnWebView2 *view,
+    KtnWebView2CookieCallback callback,
+    void *user_data
+) {
+    if (!callback) return;
+    const auto state = state_of(view);
+    ICoreWebView2CookieManager *manager = nullptr;
+    HRESULT result = cookie_manager_of(state, &manager);
+    if (SUCCEEDED(result) && manager) result = manager->DeleteAllCookies();
+    if (manager) manager->Release();
+    if (FAILED(result)) {
+        const std::string error = hresult_text("ClearCookies", result);
+        callback(user_data, 0, error.c_str());
+    } else {
+        callback(user_data, 1, nullptr);
+    }
 }

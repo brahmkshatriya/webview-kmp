@@ -13,10 +13,14 @@ import androidx.compose.ui.viewinterop.OpenGlInteropRenderTarget
 import cnames.structs.KtnWpeWebView
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_can_go_back
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_can_go_forward
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_add_user_script
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_clear_cookies
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_create
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_delete_cookie
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_destroy
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_error
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_evaluate_javascript
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_get_cookies
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_go_back
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_go_forward
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_is_loading
@@ -30,7 +34,10 @@ import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_progress
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_reload
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_render
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_scroll
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_set_cookie
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_set_focused
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_set_message_callback
+import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_set_navigation_callback
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_stop
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_title
 import dev.brahmkshatriya.webview.internal.wpe.ktn_wpe_webview_url
@@ -47,8 +54,25 @@ import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.set
 import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.suspendCoroutine
+import platform.posix.getenv
+import platform.posix.system
 
 /** Linux system WebView backed by WPE WebKit. */
 public object SystemWebViewBackend : WebViewBackendProvider {
@@ -64,6 +88,11 @@ public object SystemWebViewBackend : WebViewBackendProvider {
             WebViewCapability.LoadingProgress,
             WebViewCapability.JavaScriptControl,
             WebViewCapability.MediaPlaybackPolicy,
+            WebViewCapability.Cookies,
+            WebViewCapability.NavigationInterception,
+            WebViewCapability.UserScripts,
+            WebViewCapability.Profiles,
+            WebViewCapability.WebMessaging,
         )
 
     override fun availability(): WebViewBackendAvailability = WebViewBackendAvailability.Available
@@ -79,8 +108,11 @@ public class SystemWebViewController public constructor(
     private val config: WebViewConfig = WebViewConfig(),
 ) : WebViewController {
     private val mutableStates = MutableStateFlow(WebViewState())
+    private val mutableMessages = MutableSharedFlow<WebViewMessage>(extraBufferCapacity = 64)
     private val pendingCommands = mutableListOf<(CPointer<KtnWpeWebView>) -> Unit>()
     private var nativeHandle: CPointer<KtnWpeWebView>? = null
+    private var navigationCallbackRef: StableRef<NavigationCallback>? = null
+    private var messageCallbackRef: StableRef<SystemWebViewController>? = null
     private var closed: Boolean = false
 
     internal val interopView: NativeInteropView =
@@ -96,8 +128,11 @@ public class SystemWebViewController public constructor(
     override val backendId: WebViewBackendId = WebViewBackendId.System
     override val capabilities: WebViewCapabilities = SystemWebViewBackend.capabilities
     override val states: StateFlow<WebViewState> = mutableStates
+    override val messages: Flow<WebViewMessage> = mutableMessages
     override val state: WebViewState
         get() = mutableStates.value
+    override val profile: WebViewProfile = config.profile
+    override val cookies: WebViewCookieStore = WpeCookieStore()
 
     init {
         config.initialUrl?.takeIf(String::isNotBlank)?.let { url ->
@@ -156,6 +191,113 @@ public class SystemWebViewController public constructor(
         }
     }
 
+    override fun postMessage(data: String): Unit {
+        val quoted = JsonPrimitive(data).toString()
+        evaluateJavaScript(
+            """
+            (() => {
+                const event = new MessageEvent('message', { data: $quoted });
+                if (window.webviewKmp && typeof window.webviewKmp.onmessage === 'function') {
+                    window.webviewKmp.onmessage(event);
+                }
+                window.dispatchEvent(new MessageEvent('webview-kmp-message', { data: $quoted }));
+            })();
+            """.trimIndent(),
+        ) {}
+    }
+
+    private inner class WpeCookieStore : WebViewCookieStore {
+        override suspend fun get(url: String): List<WebViewCookie> {
+            val text = awaitCookieCall { view, userData ->
+                ktn_wpe_webview_get_cookies(
+                    view,
+                    url,
+                    staticCFunction(::onCookieResult),
+                    userData,
+                )
+            } ?: return emptyList()
+            return Json.parseToJsonElement(text).jsonArray.mapNotNull { element ->
+                runCatching {
+                    val item = element.jsonObject
+                    val expires = item["expiresAtMillis"]?.jsonPrimitive?.longOrNull
+                    WebViewCookie(
+                        name = item.getValue("name").jsonPrimitive.contentOrNull.orEmpty(),
+                        value = item.getValue("value").jsonPrimitive.contentOrNull.orEmpty(),
+                        domain = item["domain"]?.jsonPrimitive?.contentOrNull,
+                        path = item["path"]?.jsonPrimitive?.contentOrNull,
+                        expiresAtMillis = expires?.takeIf { it >= 0 },
+                        secure = item["secure"]?.jsonPrimitive?.booleanOrNull,
+                        httpOnly = item["httpOnly"]?.jsonPrimitive?.booleanOrNull,
+                        sameSite = when (item["sameSite"]?.jsonPrimitive?.intOrNull) {
+                            0 -> WebViewCookieSameSite.None
+                            1 -> WebViewCookieSameSite.Lax
+                            2 -> WebViewCookieSameSite.Strict
+                            else -> null
+                        },
+                    )
+                }.getOrNull()
+            }
+        }
+
+        override suspend fun set(url: String, cookie: WebViewCookie) {
+            val domain = cookie.domain ?: cookieHost(url)
+            awaitCookieCall { view, userData ->
+                ktn_wpe_webview_set_cookie(
+                    view = view,
+                    name = cookie.name,
+                    value = cookie.value,
+                    domain = domain,
+                    path = cookie.path ?: "/",
+                    expires_at_millis = cookie.expiresAtMillis ?: -1L,
+                    secure = cookie.secure.toNativeBoolean(),
+                    http_only = cookie.httpOnly.toNativeBoolean(),
+                    same_site = cookie.sameSite.toWpeSameSite(),
+                    callback = staticCFunction(::onCookieResult),
+                    user_data = userData,
+                )
+            }
+        }
+
+        override suspend fun delete(url: String, cookie: WebViewCookie) {
+            val existing = get(url).firstOrNull { candidate ->
+                candidate.name == cookie.name &&
+                    (cookie.domain == null || candidate.domain == cookie.domain) &&
+                    (cookie.path == null || candidate.path == cookie.path)
+            } ?: return
+            awaitCookieCall { view, userData ->
+                ktn_wpe_webview_delete_cookie(
+                    view = view,
+                    name = existing.name,
+                    value = existing.value,
+                    domain = existing.domain ?: cookieHost(url),
+                    path = existing.path ?: "/",
+                    callback = staticCFunction(::onCookieResult),
+                    user_data = userData,
+                )
+            }
+        }
+
+        override suspend fun clear() {
+            awaitCookieCall { view, userData ->
+                ktn_wpe_webview_clear_cookies(
+                    view,
+                    staticCFunction(::onCookieResult),
+                    userData,
+                )
+            }
+        }
+
+        private suspend fun awaitCookieCall(
+            call: (CPointer<KtnWpeWebView>, COpaquePointer?) -> Unit,
+        ): String? = suspendCoroutine { continuation ->
+            checkOpen()
+            submit { view ->
+                val ref = StableRef.create(CookieContinuation(continuation))
+                call(view, ref.asCPointer())
+            }
+        }
+    }
+
     override fun close(): Unit {
         if (closed) return
         closed = true
@@ -181,6 +323,7 @@ public class SystemWebViewController public constructor(
 
     private fun ensureHandle(): CPointer<KtnWpeWebView> {
         nativeHandle?.let { return it }
+        val persistentDirectories = wpePersistentProfileDirectories(config.profile)
         val created =
             memScoped {
                 val userAgent =
@@ -188,15 +331,50 @@ public class SystemWebViewController public constructor(
                         UserAgent.Default -> null
                         is UserAgent.Custom -> configured.value.cstr.getPointer(this)
                     }
+                val dataDirectory = persistentDirectories?.first?.cstr?.getPointer(this)
+                val cacheDirectory = persistentDirectories?.second?.cstr?.getPointer(this)
                 ktn_wpe_webview_create(
                     null,
                     if (config.javaScript == JavaScriptMode.Enabled) 1 else 0,
                     userAgent,
                     if (config.mediaPlaybackRequiresUserGesture) 1 else 0,
                     if (config.debugLogging) 1 else 0,
+                    if (config.profile == WebViewProfile.Ephemeral) 1 else 0,
+                    dataDirectory,
+                    cacheDirectory,
                 )
             } ?: error("Could not create WPE WebKit")
         nativeHandle = created
+        config.navigationHandler?.let { handler ->
+            val ref = StableRef.create(NavigationCallback(handler))
+            navigationCallbackRef = ref
+            ktn_wpe_webview_set_navigation_callback(
+                created,
+                staticCFunction(::onNavigationDecision),
+                ref.asCPointer(),
+            )
+        }
+        val messageRef = StableRef.create(this)
+        messageCallbackRef = messageRef
+        ktn_wpe_webview_set_message_callback(
+            created,
+            staticCFunction(::onWebMessage),
+            messageRef.asCPointer(),
+        )
+        ktn_wpe_webview_add_user_script(
+            created,
+            wpeMessagingBridgeScript,
+            0,
+            0,
+        )
+        config.userScripts.forEach { script ->
+            ktn_wpe_webview_add_user_script(
+                created,
+                script.source,
+                if (script.injectionTime == WebViewUserScriptInjectionTime.DocumentStart) 0 else 1,
+                if (script.mainFrameOnly) 1 else 0,
+            )
+        }
         val error = ktn_wpe_webview_error(created)?.toKString()?.takeIf(String::isNotBlank)
         if (error != null) mutableStates.value = state.copy(isLoading = false, error = error)
         return created
@@ -309,7 +487,17 @@ public class SystemWebViewController public constructor(
     private fun destroyNative(): Unit {
         val view = nativeHandle ?: return
         nativeHandle = null
+        ktn_wpe_webview_set_navigation_callback(view, null, null)
+        ktn_wpe_webview_set_message_callback(view, null, null)
         ktn_wpe_webview_destroy(view)
+        navigationCallbackRef?.dispose()
+        navigationCallbackRef = null
+        messageCallbackRef?.dispose()
+        messageCallbackRef = null
+    }
+
+    internal fun receiveMessage(data: String): Unit {
+        mutableMessages.tryEmit(WebViewMessage(data = data, url = state.url))
     }
 
     private fun checkOpen(): Unit = check(!closed) { "WebViewController is closed" }
@@ -318,6 +506,49 @@ public class SystemWebViewController public constructor(
 private class JavaScriptCallback(
     val callback: (JavaScriptResult) -> Unit,
 )
+
+private class NavigationCallback(
+    val handler: WebViewNavigationHandler,
+)
+
+private class CookieContinuation(
+    val continuation: Continuation<String?>,
+)
+
+private fun onNavigationDecision(
+    userData: COpaquePointer?,
+    url: CPointer<ByteVar>?,
+    method: CPointer<ByteVar>?,
+    isMainFrame: Int,
+    isRedirect: Int,
+    hasUserGesture: Int,
+): Int {
+    val callback = userData?.asStableRef<NavigationCallback>()?.get() ?: return 0
+    val requestUrl = url?.toKString() ?: return 0
+    val decision =
+        callback.handler.decide(
+            WebViewNavigationRequest(
+                url = requestUrl,
+                method = method?.toKString() ?: "GET",
+                isMainFrame = isMainFrame != 0,
+                isRedirect = isRedirect != 0,
+                hasUserGesture = hasUserGesture != 0,
+            ),
+        )
+    return when (decision) {
+        WebViewNavigationDecision.Allow -> 0
+        WebViewNavigationDecision.Cancel -> 1
+        WebViewNavigationDecision.OpenExternally -> 2
+    }
+}
+
+private fun onWebMessage(
+    userData: COpaquePointer?,
+    data: CPointer<ByteVar>?,
+): Unit {
+    val controller = userData?.asStableRef<SystemWebViewController>()?.get() ?: return
+    controller.receiveMessage(data?.toKString().orEmpty())
+}
 
 private fun onJavaScriptResult(
     userData: COpaquePointer?,
@@ -333,6 +564,71 @@ private fun onJavaScriptResult(
     } else {
         callback(JavaScriptResult.Error(text ?: "JavaScript evaluation failed"))
     }
+}
+
+private fun onCookieResult(
+    userData: COpaquePointer?,
+    success: Int,
+    value: CPointer<ByteVar>?,
+): Unit {
+    val stableRef = userData?.asStableRef<CookieContinuation>() ?: return
+    val continuation = stableRef.get().continuation
+    val text = value?.toKString()
+    stableRef.dispose()
+    if (success != 0) continuation.resume(text)
+    else continuation.resumeWithException(IllegalStateException(text ?: "Cookie operation failed"))
+}
+
+private fun cookieHost(url: String): String {
+    val authority = url.substringAfter("://", url).substringBefore('/')
+    return authority.substringBefore(':').trim().also {
+        require(it.isNotEmpty()) { "Cookie URL has no host: $url" }
+    }
+}
+
+private fun Boolean?.toNativeBoolean(): Int = when (this) {
+    true -> 1
+    false -> 0
+    null -> -1
+}
+
+private fun WebViewCookieSameSite?.toWpeSameSite(): Int = when (this) {
+    WebViewCookieSameSite.None -> 0
+    WebViewCookieSameSite.Lax -> 1
+    WebViewCookieSameSite.Strict -> 2
+    null -> -1
+}
+
+private val wpeMessagingBridgeScript: String =
+    """
+    (() => {
+        const nativeBridge = window.webkit?.messageHandlers?.webviewKmp;
+        if (!nativeBridge) return;
+        window.webviewKmp = window.webviewKmp || {};
+        window.webviewKmp.postMessage = data => nativeBridge.postMessage(String(data));
+    })();
+    """.trimIndent()
+
+private fun wpePersistentProfileDirectories(profile: WebViewProfile): Pair<String, String>? {
+    if (profile !is WebViewProfile.Persistent) return null
+    val safeName =
+        profile.name.map { char ->
+            if (char.isLetterOrDigit() || char == '.' || char == '_' || char == '-') char else '_'
+        }.joinToString("")
+    val dataHome =
+        getenv("XDG_DATA_HOME")?.toKString()?.takeIf(String::isNotBlank)
+            ?: getenv("HOME")?.toKString()?.let { "$it/.local/share" }
+            ?: "/tmp"
+    val cacheHome =
+        getenv("XDG_CACHE_HOME")?.toKString()?.takeIf(String::isNotBlank)
+            ?: getenv("HOME")?.toKString()?.let { "$it/.cache" }
+            ?: "/tmp"
+    val dataDirectory = "$dataHome/webview-kmp/profiles/wpe/$safeName"
+    val cacheDirectory = "$cacheHome/webview-kmp/profiles/wpe/$safeName"
+    check(system("mkdir -p -- '${dataDirectory.replace("'", "'\\''")}' '${cacheDirectory.replace("'", "'\\''")}'") == 0) {
+        "Could not create WPE WebKit profile directories"
+    }
+    return dataDirectory to cacheDirectory
 }
 
 @Composable
